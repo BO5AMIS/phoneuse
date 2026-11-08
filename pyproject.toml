@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phoneuse"
+version = "0.1.0"
+description = "See and operate an unmodified iPhone from a PC: AirPlay for the screen, Bluetooth HID for input"
+requires-python = ">=3.11"
+license = "MIT"
+# Linux runs from the checkout with system packages (python-dbus, python-gobject, ...);
+# see README. These are what Windows needs (scripts/windows/install.ps1 installs them).
+dependencies = [
+    "av>=14; sys_platform == 'win32'",            # FFmpeg: decode the phone's stream, encode it again
+    "numpy; sys_platform == 'win32'",
+    "pillow; sys_platform == 'win32'",
+    "aiohttp; sys_platform == 'win32'",           # the browser mirror
+    "psutil; sys_platform == 'win32'",            # is a phone mirroring (AirPlay's TCP connection)
+    "mcp>=2.3; sys_platform == 'win32'",          # the MCP server
+    # Bluetooth LE HID and notifications through the Windows Runtime
+    "winrt-runtime; sys_platform == 'win32'",
+    "winrt-Windows.Devices.Bluetooth; sys_platform == 'win32'",
+    "winrt-Windows.Devices.Bluetooth.GenericAttributeProfile; sys_platform == 'win32'",
+    "winrt-Windows.Devices.Enumeration; sys_platform == 'win32'",
+    "winrt-Windows.Devices.Radios; sys_platform == 'win32'",
+    "winrt-Windows.Foundation; sys_platform == 'win32'",
+    "winrt-Windows.Foundation.Collections; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams; sys_platform == 'win32'",
+    "winrt-Windows.UI.Notifications; sys_platform == 'win32'",
+    "winrt-Windows.Data.Xml.Dom; sys_platform == 'win32'",
+]
+
+[project.scripts]
+phoneuse = "phoneuse.cli:main"
+phoneuse-mcp = "phoneuse.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["phoneuse*"]
+namespaces = true  # phoneuse/web and phoneuse/sounds hold data files only
+
+[tool.setuptools.package-data]
+phoneuse = ["sdp_record.xml"]
+"phoneuse.web" = ["*.html"]
+"phoneuse.sounds" = ["*.wav"]

@@ -1,6 +1,6 @@
 ---
 name: phoneuse
-description: See and operate the user's iPhone from this Linux PC with the `phoneuse` CLI (AirPlay mirror for the screen, Bluetooth mouse/keyboard for input). Use when a task needs the iPhone: open or use an app, read what is on the phone screen, tap, type, swipe, check a notification, change a phone setting, or test something on the device. Also use when the mirror or the Bluetooth link needs starting or fixing.
+description: See and operate the user's iPhone from this PC (Linux or Windows) with the `phoneuse` CLI (AirPlay mirror for the screen, Bluetooth mouse/keyboard for input). Use when a task needs the iPhone: open or use an app, read what is on the phone screen, tap, type, swipe, check a notification, change a phone setting, or test something on the device. Also use when the mirror or the Bluetooth link needs starting or fixing.
 ---
 
 # Operating the iPhone with phoneuse
@@ -14,7 +14,9 @@ the full list.
 ## Before acting
 
 1. Run `phoneuse status`. You need `HID service: active`, `connected=True`, and
-   `Mirror window: ... showing the phone`.
+   `Mirror window: ... showing the phone` (Windows: `Mirror: showing the phone`).
+   If something is off and you don't see why, `phoneuse doctor` checks the whole
+   setup and prints the fix for each problem.
 2. No mirror window: check whether `phoneuse up` is running. If it isn't, start it
    somewhere the user can see it (a terminal or tmux window they use), not hidden in
    the background. "not mirroring" (or no window): ask the user to start Screen
@@ -28,8 +30,10 @@ the full list.
    is for the user to watch: act through `phoneuse` commands, never by clicking in
    the page.
 4. `connected=False`: run `phoneuse status` again after a few seconds (the daemon
-   reconnects), then ask the user to tap "PhoneUse" in the iPhone's Bluetooth settings.
-5. HID service not active: `phoneuse install` (needs sudo) sets it up.
+   reconnects), then ask the user to tap "PhoneUse" in the iPhone's Bluetooth settings
+   (Windows: the PC's name, which `phoneuse status` shows as `name=`).
+5. HID service not active: on Linux `phoneuse install` (needs sudo) sets it up; on
+   Windows `phoneuse up` starts it (it keeps running after `up` stops).
 
 ## MCP or CLI
 

@@ -64,10 +64,11 @@ def entry(name=None):
 
 def needs_calibration(name=None):
     """Whether this phone should be measured on connect: it has no table of its own
-    and isn't the model that touch.REF_PTS was measured on."""
-    from .touch import REF_MODEL
+    and isn't the model that touch.REF_PTS was measured on. Over Bluetooth LE
+    (Windows) no phone is: that table was measured over Classic."""
+    from .touch import LINK, REF_MODEL
     e = entry(name)
-    return not e.get("drag_pts") and e.get("model") != REF_MODEL
+    return not e.get("drag_pts") and (LINK == "ble" or e.get("model") != REF_MODEL)
 
 
 def save_calibration(name, table):

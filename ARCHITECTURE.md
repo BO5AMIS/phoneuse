@@ -129,3 +129,80 @@ every frame, which is how the drag problems above were found. `touchlab/` shows
 what iOS turns the reports into. `tools/latency.py` times pointer jumps from
 report to screen, and `PHONEUSE_TRACE=1 phoneuse up` turns on GStreamer's
 per-element latency tracer.
+
+## On Windows
+
+The same two channels, built from what Windows offers. Everything above the HID
+command protocol and the frames service (pointer.py, touch.py, the CLI, the MCP
+server, the browser page, settling, vision) is shared.
+
+```
+            AirPlay video (Wi-Fi)                         Bluetooth LE HID (HID over GATT)
+ iPhone  ─────────────────────────▶  UxPlay (MSYS2 build)      ◀──────────  windows/hid.py
+                                       │ RTP, 127.0.0.1:5590                  (Windows Runtime GATT server,
+                                       ▼                                       user process, no driver)
+                                    avhub.py ── TCP subscriptions ──▶ frames.py, web.py      ▲
+                                    (PyAV: decode once, NVENC again)       │                  │ 127.0.0.1 + token
+                                                                    Edge app window ─ input ──┤ (ipc.py)
+                                                                    phoneuse CLI / MCP ───────┘
+```
+
+**`phoneuse/windows/hid.py`** replaces the BlueZ daemon. Windows has no API for
+being a Bluetooth Classic HID device, but its GATT server (`GattServiceProvider`)
+accepts the HID service (0x1812): the PC's own adapter advertises it, and the
+iPhone pairs and connects as with any Bluetooth LE keyboard. The report
+descriptor is the Linux one (`hidproto.py`), one Report characteristic per report
+id with its Report Reference descriptor; reading them needs encryption, which
+makes the phone bond first. Windows refuses to publish a connectable service that
+isn't discoverable (measured: aborted), so the battery service is advertised too.
+The service speaks the Linux daemon's command protocol. Differences: the phone
+connects, never the PC (`connect` waits for the phone to come back), and reports
+go out once per connection interval. phoneuse asks Windows for throughput-
+optimized connection parameters and spaces reports at least one interval apart,
+since two reports in one connection event reach iOS a fraction of a millisecond
+apart and iOS drops pointer motion faster than ~8 ms. Each phone's drag table is
+measured as on Linux (calibrate.py, phones.json), at this pace; until then
+touch.BLE_REF_PTS stands in (an iPhone 14 Pro Max over LE). The service also runs on
+its own, outside `phoneuse up`: each start republishes the GATT services, and an
+iPhone that saw them disappear and come back kept using a stale copy until it was
+paired again. Reports that land in a link drop wait (up to 5 s) for the phone to
+come back instead of failing.
+
+**`phoneuse/avhub.py`** is the video hub, in PyAV instead of GStreamer: it
+reassembles UxPlay's RTP (`rtp.py`), decodes with FFmpeg in low-delay mode, keeps
+the last frame and encodes again with NVENC (x264 without an NVIDIA GPU; 2.7 ms a
+frame on an RTX 4080). Viewers subscribe over a TCP connection and get a keyframe
+of the last frame at once; a subscription lasts as long as its connection, so
+there is nothing to renew or time out, and a viewer that falls behind skips to a
+fresh keyframe instead of piling up delay. Whether a phone is mirroring comes from
+UxPlay's TCP connection on port 7100 (psutil).
+
+**UxPlay** is built from source in MSYS2 (`scripts/windows/build-uxplay.sh`),
+pinned to a tested commit; 1.74 brings its own mDNS responder, so Bonjour isn't
+needed. It logs with `printf` and never flushes, which over a pipe would hold back
+the "connection request from" line that tells the HID service which phone is
+mirroring; a forced-include header turns stdout buffering off (a compiler flag,
+no source change). UxPlay would take its AirPlay device ID from the first network
+adapter's MAC, often a Hyper-V adapter whose address changes, so phoneuse passes a
+fixed random one (`airplay-id` in the config directory).
+
+**Local services** (`ipc.py`) use TCP on 127.0.0.1 instead of unix sockets. Each
+connection starts with a per-user token from `%LOCALAPPDATA%\phoneuse\run`:
+without it any web page could POST line commands to these ports. Connecting to a
+closed local port normally takes 2 s on Windows (SYN retries); ipc.py turns the
+retries off, so a stopped service is noticed at once.
+
+**`phoneuse up`** puts every service but the Bluetooth one in a job object that
+kills them when `up` ends, however it ends (closed window, Ctrl+C, crash), so no
+orphaned uxplay.exe holds the AirPlay ports. It refuses to start twice. The mirror window is the
+browser mirror in Edge or Chrome app mode with a profile of its own; in it, Ctrl
+is Cmd, since the Windows key belongs to the Start menu. The saved passcode is
+encrypted with DPAPI for the Windows user; unlock requests also show as a Windows
+notification that opens the page. `phoneuse doctor` checks the whole setup,
+including Block rules Windows adds for UxPlay when its firewall prompt is
+dismissed, which would otherwise silently hide the receiver from the phone.
+
+`tests/` checks this side without a phone: `e2e_video.py` streams a synthetic
+picture through the hub, frames service and browser mirror the way UxPlay does;
+`e2e_page.py` has headless Edge decode it; `test_offline.py` covers RTP
+reassembly, the HID tables, the absolute-report nudge and the screen size by model.

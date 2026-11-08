@@ -1,8 +1,9 @@
 """The browser mirror: the phone's screen, with mouse and keyboard, on a local
 web page (http://localhost:PORT, `web_port` in config.toml).
 
-The video comes from the hub (hub.py) as RTP over localhost. When a tab joins,
-this server asks the hub for a keyframe, so the tab shows the phone right away.
+The video comes from the hub (hub.py on Linux, as RTP over localhost; avhub.py on
+Windows, as a subscription). When a tab joins, this server asks the hub for a
+keyframe, so the tab shows the phone right away.
 
 Each tab gets encoded frames over a WebSocket and decodes them itself
 (WebCodecs). Mouse and keyboard events come back over the same WebSocket and
@@ -12,7 +13,7 @@ accepted while the phone is mirroring and the tab is showing it.
 Listens on 127.0.0.1 only: anyone who can open the page can control the phone.
 
 Unlocking: the page's settings panel saves the phone's passcode in
-~/.config/phoneuse/passcode (mode 600). `phoneuse unlock` asks to use it (POST /api/unlock); the owner answers on
+the config directory (unlock.py). `phoneuse unlock` asks to use it (POST /api/unlock); the owner answers on
 the page or in a desktop notification, and only then is it typed (unlock.py).
 """
 import asyncio
@@ -23,16 +24,12 @@ import sys
 import threading
 import time
 
-import gi
+from aiohttp import web
 
-gi.require_version("Gst", "1.0")
-from gi.repository import Gst  # noqa: E402
-from aiohttp import web  # noqa: E402
-
-from . import screen, unlock  # noqa: E402
-from .config import CFG, NAME, SCREEN_PT, config_path  # noqa: E402
-from .hidclient import Hid  # noqa: E402
-from .pointer import Keys, Pointer  # noqa: E402
+from . import screen, unlock
+from .config import CFG, IS_WINDOWS, NAME, SCREEN_PT, config_path
+from .hidclient import Hid
+from .pointer import Keys, Pointer
 
 # Where the pointer rests after Bluetooth (re)connects, and where keep-awake nudges
 # it until someone moves it: the bottom middle, above the home bar, where a resting
@@ -49,10 +46,55 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), "web:", *a, flush=True)
 
 
-class Stream:
-    """The hub's stream (hub.py), as H.264 access units for the tabs."""
+class QuietErrors:
+    """Logs an error once while it keeps repeating (every input fails while the HID
+    service restarts), then how many more there were."""
+
+    def __init__(self):
+        self.last, self.since, self.more = None, 0.0, 0
+
+    def __call__(self, label, e):
+        msg, now = f"{label} {e}", time.monotonic()
+        if msg == self.last and now - self.since < 10:
+            self.more += 1
+            return
+        if self.more:
+            log(f"(the error before repeated {self.more} more times)")
+        log(msg)
+        self.last, self.since, self.more = msg, now, 0
+
+
+input_error = QuietErrors()
+
+
+class AvStream:
+    """Windows: the hub's stream (avhub.py), as H.264 access units for the tabs."""
 
     def __init__(self, on_frame):
+        from .avhub import subscribe
+        self.subscribed = False
+        threading.Thread(target=subscribe, args=(on_frame, self._state), daemon=True).start()
+
+    def _state(self, on):
+        self.subscribed = on
+
+    @staticmethod
+    def keyframe():
+        """Ask the hub for a keyframe (a tab joined or its decoder started over)."""
+        try:
+            screen.hub_request("keyframe")
+        except OSError as e:
+            log("hub:", e)
+
+
+class Stream:
+    """Linux: the hub's stream (hub.py), as H.264 access units for the tabs."""
+
+    def __init__(self, on_frame):
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        self.Gst = Gst
         self.on_frame = on_frame  # (bytes, is_keyframe), called from a GStreamer thread
         rtp = "application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload=96"
         self.pipe = Gst.parse_launch(
@@ -66,6 +108,7 @@ class Stream:
         self.pipe.set_state(Gst.State.PLAYING)
 
     def _frame(self, sink):
+        Gst = self.Gst
         buf = sink.emit("pull-sample").get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
         if ok:
@@ -90,7 +133,7 @@ class Mirror:
     def __init__(self):
         self.loop = None
         self.tabs = set()
-        self.stream = Stream(self._frame)
+        self.stream = (AvStream if IS_WINDOWS else Stream)(self._frame)
         self.mirroring = False
         self.hub_live = False
         self.hid = None
@@ -237,6 +280,8 @@ class Mirror:
         self.last_frame_at = time.time()
         if self.screen_dark:
             self.screen_dark = False
+        if self.loop is None:  # the hub's first keyframe can beat the server's start; tabs ask again
+            return
         self.loop.call_soon_threadsafe(self._send_frame, data, key)
 
     def _send_frame(self, data, key):
@@ -252,14 +297,18 @@ class Mirror:
         loop = asyncio.get_running_loop()
         joined = False
         while True:
+            mirroring = False
             try:
-                line, _ = await loop.run_in_executor(None, screen.hub_request, f"{'keep' if joined else 'join'} {RTP_PORT}")
-                joined = line.startswith("ok")
+                if not IS_WINDOWS:  # Linux viewers renew their UDP subscription; Windows ones stay connected
+                    line, _ = await loop.run_in_executor(None, screen.hub_request, f"{'keep' if joined else 'join'} {RTP_PORT}")
+                    joined = line.startswith("ok")
                 line, _ = await loop.run_in_executor(None, screen.hub_request, "status")
                 self.hub_live = "live=1" in line
+                mirroring = "mirroring=1" in line
             except OSError:
                 joined, self.hub_live = False, False  # the hub is (re)starting
-            mirroring = screen.airplay_mirroring()
+            if not IS_WINDOWS:
+                mirroring = screen.airplay_mirroring()
             bt = await loop.run_in_executor(None, self.bluetooth_up)
             changed = mirroring != self.mirroring or bt != self.bluetooth
             if bt and not self.bluetooth:  # (re)connected: rest the pointer where it touches nothing
@@ -428,6 +477,14 @@ class UnlockRequests:
 
     async def _notify(self, p):
         # A desktop notification with Unlock / Deny, where the notification daemon supports actions.
+        # Windows: a notification that opens the page, where the owner answers.
+        if IS_WINDOWS:
+            from .windows import notify
+            await asyncio.get_running_loop().run_in_executor(
+                None, notify.show, "Unlock the iPhone?",
+                "An agent asks to enter your saved passcode. Answer in the PhoneUse window.",
+                f"http://localhost:{PORT}/")
+            return
         try:
             p["notice"] = await asyncio.create_subprocess_exec(
                 "notify-send", "-a", "phoneuse", "-u", "critical", "--wait", "-A", "unlock=Unlock", "-A", "deny=Deny",
@@ -608,7 +665,7 @@ def app(mirror):
                     try:
                         tab.handle(json.loads(m.data))
                     except Exception as e:
-                        log("input error:", e)
+                        input_error("input error:", e)
                         mirror.hid = None
         finally:
             pump.cancel()
@@ -706,11 +763,17 @@ def app(mirror):
 
 
 def main():
-    Gst.init(None)
+    if IS_WINDOWS:
+        from .windows import precise_timers
+        precise_timers()
+    else:
+        import gi
+        gi.require_version("Gst", "1.0")
+        from gi.repository import GLib, Gst
+        Gst.init(None)
+        # GStreamer's bus signals need a GLib main loop; run one beside asyncio.
+        threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
     mirror = Mirror()
-    # GStreamer's bus signals need a GLib main loop; run one beside asyncio.
-    from gi.repository import GLib
-    threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
 
     async def start():
         mirror.loop = asyncio.get_running_loop()

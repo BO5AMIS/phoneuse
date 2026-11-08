@@ -1,0 +1,5 @@
+# Shell scripts run in bash (also MSYS2's on Windows): LF even where git converts line endings.
+*.sh text eol=lf
+bin/phoneuse text eol=lf
+bin/phoneuse-mcp text eol=lf
+tools/hidctl text eol=lf

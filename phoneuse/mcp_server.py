@@ -22,7 +22,8 @@ from typing import Literal
 from PIL import Image as PILImage
 from mcp.server.mcpserver import Image, MCPServer
 
-from . import cli, touch
+from . import cli, config, touch
+from .config import runtime_path
 
 # Code changes reach a running server: before each tool call, the phoneuse modules
 # whose files changed since the last call are reloaded in place, dependencies
@@ -93,6 +94,10 @@ server = MCPServer(
 def _quietly(fn):
     """Run a CLI helper: its prints are captured (stdout carries the protocol), and
     its errors (they exit) become a message."""
+    # Since this server started, a phone of another model may have started mirroring:
+    # its screen size (no code changed, so _reload_changed doesn't cover it). The drag
+    # table follows the mirroring phone by itself (touch.refresh).
+    config.refresh_screen()
     out, err = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -164,7 +169,7 @@ def _strip():
         strip.paste(f.resize((w, h), PILImage.LANCZOS), (i * (w + 6), 0))
     buf = io.BytesIO()
     strip.save(buf, "JPEG", quality=82)
-    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"phoneuse-strip-{os.getpid()}.png")
+    path = runtime_path(f"phoneuse-strip-{os.getpid()}.png")
     with open(path, "wb") as f:
         f.write(png)
     try:

@@ -10,3 +10,8 @@ bridge/sdkconfig
 bridge/sdkconfig.old
 bridge/managed_components/
 bridge/dependencies.lock
+
+# Windows launchers (scripts/windows/install.ps1 copies them from .venv)
+bin/*.exe
+.scratch/
+phoneuse.egg-info/

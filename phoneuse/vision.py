@@ -1,6 +1,7 @@
-"""Vision service for `phone`: keeps OCR and a GUI grounding model loaded.
+"""Vision service for `phoneuse`: keeps OCR and a GUI grounding model loaded.
 
-Runs in .venv-vision (its own deps; `python -m phoneuse.vision`). Listens on $XDG_RUNTIME_DIR/iphone-vision.sock;
+Runs in .venv-vision (its own deps; `python -m phoneuse.vision`). Listens on the
+"vision" service (ipc.py: a unix socket on Linux, 127.0.0.1 + token on Windows);
 one JSON request per connection, one JSON reply:
   {"op": "text", "image": PATH}            -> {"lines": [{"text", "x", "y", "w", "h", "conf"}]}
   {"op": "find", "image": PATH, "what": S} -> {"x", "y"}   (fractions of the image)
@@ -16,12 +17,11 @@ Models (chosen 2026-11-06 on real iPhone screenshots):
 import json
 import os
 import re
-import socket
 import sys
-import threading
 import time
 
-SOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse-vision.sock")
+from . import ipc
+
 GROUNDER = "HongxinLi/GoClick-Large"
 
 
@@ -31,9 +31,17 @@ def log(*a):
 
 class Vision:
     def __init__(self):
+        import threading
+        import onnxruntime
+        if sys.platform == "win32" and hasattr(onnxruntime, "preload_dlls"):
+            # Windows: CUDA and cuDNN for onnxruntime-gpu come from pip (its [cuda,cudnn]
+            # extras); load them before the first session, or OCR falls back to the CPU.
+            try:
+                onnxruntime.preload_dlls()
+            except Exception as e:
+                log("CUDA libraries for OCR:", e)
         from rapidocr import RapidOCR
         import logging
-        import onnxruntime
         logging.getLogger("RapidOCR").setLevel(logging.WARNING)
         # No text-orientation classifier: iOS text is upright (saves ~75 ms). On an
         # NVIDIA GPU (onnxruntime-gpu) a screen takes ~0.18 s, on the CPU ~1.2 s.
@@ -45,18 +53,21 @@ class Vision:
         self.ocr_device = "cuda" if params.get("EngineConfig.onnxruntime.use_cuda") else "cpu"
         log("OCR on", self.ocr_device)
         self._g = None
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # one request at a time
+        self.g_lock = threading.Lock()  # the grounder loads once, even when asked twice
 
     def grounder(self):
-        if self._g is None:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoProcessor
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype = torch.float16 if dev == "cuda" else torch.float32
-            model = AutoModelForCausalLM.from_pretrained(GROUNDER, trust_remote_code=True, torch_dtype=dtype).to(dev).eval()
-            proc = AutoProcessor.from_pretrained(GROUNDER, trust_remote_code=True)
-            self._g = (model, proc, dev, dtype)
-            log("grounder loaded on", dev)
+        with self.g_lock:
+            if self._g is None:
+                import torch
+                from transformers import AutoModelForCausalLM, AutoProcessor
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+                dtype = torch.float16 if dev == "cuda" else torch.float32
+                model = AutoModelForCausalLM.from_pretrained(GROUNDER, trust_remote_code=True,
+                                                             torch_dtype=dtype).to(dev).eval()
+                proc = AutoProcessor.from_pretrained(GROUNDER, trust_remote_code=True)
+                self._g = (model, proc, dev, dtype)
+                log("grounder loaded on", dev)
         return self._g
 
     def text(self, image):
@@ -89,6 +100,8 @@ class Vision:
         return {"x": int(m[0][0]) / 1000, "y": int(m[0][1]) / 1000}
 
     def handle(self, req):
+        if req["op"] == "find":
+            self.grounder()  # a first load can take a while: don't hold up OCR meanwhile
         with self.lock:
             if req["op"] == "text":
                 return self.text(req["image"])
@@ -100,33 +113,23 @@ class Vision:
 
 
 def serve():
+    import threading
     v = Vision()
     threading.Thread(target=v.grounder, daemon=True).start()  # warm up in the background
+    ipc.serve("vision", lambda conn, rfile: _client(v, conn, rfile), log=log)
+
+
+def _client(v, conn, rfile):  # requests: {"op": "text" | "find" | "ping", ...}
     try:
-        os.unlink(SOCK)
-    except FileNotFoundError:
-        pass
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.bind(SOCK)
-    s.listen(8)
-    log("vision service on", SOCK)
-    while True:
-        conn, _ = s.accept()
-        threading.Thread(target=_client, args=(v, conn), daemon=True).start()
-
-
-def _client(v, conn):  # requests: {"op": "text" | "find" | "ping", ...}
-    with conn:
-        try:
-            req = json.loads(conn.makefile().readline())
-            reply = v.handle(req)
-        except Exception as e:
-            reply = {"error": str(e)}
-        try:
-            data = json.dumps(reply)
-        except TypeError as e:
-            data = json.dumps({"error": f"bad reply: {e}"})
-        conn.sendall((data + "\n").encode())
+        req = json.loads(rfile.readline())
+        reply = v.handle(req)
+    except Exception as e:
+        reply = {"error": str(e)}
+    try:
+        data = json.dumps(reply)
+    except TypeError as e:
+        data = json.dumps({"error": f"bad reply: {e}"})
+    conn.sendall((data + "\n").encode())
 
 
 if __name__ == "__main__":

@@ -77,6 +77,27 @@ points, which is plenty for scrolling and edge gestures.
   (including empty ones, which keeps slow drags alive), sized from a measured
   table (`touch.DRAG_PTS`) and rounded down so the touch never overshoots.
 
+## On Windows (Bluetooth LE)
+
+- Reports reach the phone once per Bluetooth LE connection interval (iOS settles
+  on 15 ms for a keyboard), not every 8 ms as over Classic. The HID service spaces
+  them at least one interval apart: two reports in one connection event arrive a
+  fraction of a millisecond apart, and iOS drops pointer motion that comes faster
+  than ~8 ms, so drags would lose distance.
+- Each phone's drag table is measured over this link (`phoneuse calibrate`, also
+  automatic the first time its pointer is on); the iPhone 17 Pro table from Classic
+  doesn't apply. Measured on two phones over LE, a report moved 0.08-0.3x as far as
+  that table says (phones also differ by Tracking Speed). Taps use the absolute
+  pointer and need no calibration.
+- Scroll drags over LE use small steps (at most 6 pt a report) and a steady end, and
+  go 8 pt further than asked: a scroll view starts following the finger only after a
+  few points, and those never come back (scroll-by fell 7.5-10 pt short).
+- `open` checks each step on the screen: the first Spotlight opened right after an
+  app closes ignores typed keys, Spotlight keeps its last search, and Enter once left
+  the home screen; so it opens Spotlight again when needed, selects the old search,
+  and taps the app it finds instead of pressing Enter.
+- In the mirror window Ctrl is Cmd: the Windows key belongs to the Start menu.
+
 ## iPhone settings this relies on
 
 - Accessibility → Touch → AssistiveTouch: on; Dwell Control: off (otherwise a

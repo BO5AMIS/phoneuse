@@ -31,6 +31,13 @@ import time
 from . import touch
 
 MIN_GAP = 1 / 250  # at most this many hover reports per second
+# Over Bluetooth LE (Windows) a report takes a whole connection interval (~16 ms) to go
+# out, so the tick doesn't sleep after a hover report on top of that (the pointer got
+# ~42 updates a second instead of ~64).
+LE = touch.LINK == "ble"
+# The wheel drags faster than agents' exact scrolls (touch.SCROLL_MAX is small over LE
+# for accuracy): a hand on the wheel wants the page to keep up more than exactness.
+WHEEL_MAX = 30.0  # pt per report
 SCROLL_STILL = touch.SCROLL_HOLD  # lift once the wheel scroll is done and the wheel idle this long (s)
 SCROLL_MARGIN = 0.06  # regrip before the touch comes this close to an edge (screen fraction)
 GRIP_DELAY = 0.024  # between the hover to the grip point and the press (s)
@@ -67,9 +74,10 @@ class Pointer:
     def hover(self, fx, fy):
         # Only note the newest position: the tick sends it within 8 ms. Sending here
         # would hold up the caller (the page server's event loop) on Bluetooth, and
-        # the moves behind it would queue up and trail the mouse.
-        with self.lock:
-            self.at = (fx, fy)
+        # the moves behind it would queue up and trail the mouse. No lock either: the
+        # tick holds it while a report goes out, a whole connection interval (~16 ms)
+        # over Bluetooth LE, and one assignment needs none.
+        self.at = (fx, fy)
 
     def _send_hover(self):
         # (called with the lock held; also from _tick for a position that was rate-limited)
@@ -79,6 +87,8 @@ class Pointer:
             if "dropped" not in r:  # skipped while the link was busy: the next tick sends it again
                 self.sent = pos
             self.last_send = time.time()
+            return True
+        return False
 
     def scroll(self, dx_pt, dy_pt):
         """Scroll by dragging the content dx_pt, dy_pt phone points (positive dy
@@ -126,11 +136,11 @@ class Pointer:
                 room = min(room, max(edge, 0.0) / abs(d[i]))
         if room < 0.5:
             return [0.0, 0.0], True
-        if room < touch.SCROLL_CRAWL:  # the last points crawl: one report every few ticks
+        if room < touch.SCROLL_CRAWL and touch.scroll_crawls():  # the last points crawl: one report every few ticks
             self.crawl += 1
             if self.crawl % touch.SCROLL_CRAWL_TICKS:
                 return [0.0, 0.0], False
-        v = touch.scroll_step(room)
+        v = touch.scroll_step(room, most=WHEEL_MAX)
         return [d[0] * v, d[1] * v], False
 
     def _grip_tick(self, now):
@@ -210,8 +220,14 @@ class Pointer:
         # acceleration predictable. The button stays 0 on these reports: iOS
         # holds the touch from the absolute press, and a button here reads as a
         # second press/release (double tap sounds).
+        hovered = False
         while not self.stopped:
-            time.sleep(touch.TICK)
+            # Over Bluetooth LE a hover report already takes a connection interval
+            # (~16 ms) to go out: sleeping a tick on top held the pointer to ~42 updates
+            # a second. Drags keep the tick: the calibration was measured with it.
+            if not (hovered and LE):
+                time.sleep(touch.TICK)
+            hovered = False
             try:
                 with self.lock:
                     now = time.time()
@@ -225,7 +241,7 @@ class Pointer:
                         if self.grip is not None:
                             continue
                         elif self.at is not None:
-                            self._send_hover()
+                            hovered = self._send_hover()
                         continue
                     fx, fy = self.at
                     lx, ly = self.dragged_from

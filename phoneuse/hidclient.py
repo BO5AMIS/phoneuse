@@ -1,23 +1,31 @@
-"""Client for the phoneuse HID daemon's command socket (see hid_daemon.py)."""
-import socket
+"""Client for the HID service's command socket (hid_daemon.py on Linux,
+windows/hid.py on Windows; both speak the same line protocol)."""
 import threading
 
-from .config import HID_SOCKET
+from . import ipc
 
 
 class Hid:
-    """One connection to the daemon. Thread-safe: commands are serialized."""
+    """One connection to the HID service. Thread-safe: commands are serialized."""
 
-    def __init__(self, path=HID_SOCKET):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(path)
-        self.f = self.sock.makefile()
+    def __init__(self, timeout=None):
+        self.sock = ipc.connect("hid", timeout=5.0)
+        self.sock.settimeout(timeout)
+        self.f = self.sock.makefile("rb")
         self.lock = threading.Lock()
 
     def cmd(self, line):
         with self.lock:
             self.sock.sendall((line + "\n").encode())
-            reply = self.f.readline().strip()
+            reply = self.f.readline().decode(errors="replace").strip()
+        if not reply:
+            raise RuntimeError("the HID service closed the connection")
         if not reply.startswith("ok"):
             raise RuntimeError(reply)
         return reply
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass

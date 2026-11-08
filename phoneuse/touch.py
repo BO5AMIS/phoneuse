@@ -15,8 +15,8 @@ import threading
 import time
 
 from . import phones
-from .config import SCREEN_PT  # the phone screen in points (config: screen_points)
-TICK = 0.008  # one relative report per tick
+from .config import IS_WINDOWS, SCREEN_PT  # the phone screen in points (config: screen_points)
+TICK = 0.008  # one relative report per tick (Bluetooth LE: the HID service spaces them further, windows/hid.py)
 RAMP = 1.0  # no start-of-motion correction: touchlab shows requested distances land exactly
 
 # Points moved by one relative report of N units (8 ms pacing), measured on the
@@ -26,7 +26,15 @@ RAMP = 1.0  # no start-of-motion correction: touchlab shows requested distances 
 REF_PTS = [(1, 3.6), (2, 6.9), (3, 12.1), (4, 17.6), (5, 25.6), (6, 33.3), (8, 46.6),
            (10, 62.1), (12, 76.3), (16, 104.1), (20, 141.8), (28, 199.7)]
 REF_MODEL = "iPhone18,1"  # the iPhone 17 Pro that REF_PTS was measured on: it needs no calibration
-DRAG_PTS = REF_PTS
+# Windows is a Bluetooth LE keyboard and mouse (windows/hid.py): one report per 15 ms
+# connection interval instead of 8 ms. Until a phone is calibrated there, this table
+# stands in, measured over LE on an iPhone 14 Pro Max (iOS 26.5); an iPhone 17 Pro Max
+# measured within ~10% of it (8 and 20 units). No phone is the reference over LE.
+LINK = "ble" if IS_WINDOWS else "classic"
+BLE_REF_PTS = [(1, 0.3), (2, 0.6), (3, 1.1), (4, 1.6), (5, 2.3), (6, 3.0), (8, 4.7), (10, 6.9),
+               (12, 9.3), (16, 15.4), (20, 23.0), (28, 42.7), (40, 84.0)]
+DEFAULT_PTS = BLE_REF_PTS if LINK == "ble" else REF_PTS
+DRAG_PTS = DEFAULT_PTS
 _PTS = [p for _, p in DRAG_PTS]
 _stamp = None
 _checked = 0.0
@@ -45,7 +53,7 @@ def refresh(force=False):
         return
     _stamp = st
     table = phones.entry().get("drag_pts")
-    DRAG_PTS = [tuple(x) for x in table] if table else REF_PTS
+    DRAG_PTS = [tuple(x) for x in table] if table else DEFAULT_PTS
     _PTS = [p for _, p in DRAG_PTS]
 
 
@@ -168,30 +176,75 @@ SCROLL_MAX = 30.0  # ...at most this many points
 SCROLL_CRAWL = 20.0  # the very last points go one unit every SCROLL_CRAWL_TICKS ticks
 SCROLL_CRAWL_TICKS = 3  # (~150 pt/s)
 SCROLL_HOLD = 0.15  # rest before lifting (s)
+# The tail's step in points. Over Bluetooth Classic it is one unit (3.6 pt per 8 ms
+# tick), and the last SCROLL_CRAWL points crawl with pauses between reports. Over
+# Bluetooth LE a unit moves only ~0.3 pt (calibrated), so a tail of single units made
+# a 0.2-screen scroll take 4 s; but pauses between bigger reports break the
+# calibration, which is measured at a steady pace (iOS accelerates by speed: with
+# 3.6 pt steps and crawl pauses, scrolls fell 25-30% short). So over LE the tail goes
+# at a steady report per connection interval, sized for ~150 pt/s, the old crawl speed.
+REPORT_PERIOD = 0.015 if LINK == "ble" else TICK  # one report per 15 ms connection interval (LE)
+SCROLL_TAIL_SPEED = 150.0  # pt/s
+# Over LE, big reports move the touch unpredictably (calibration measures each size at
+# a steady pace, but a scroll starts its biggest reports from rest). Measured on the
+# Settings list, content moved for 0.2 / 0.3 screen: at most 30 pt per report 0.142-
+# 0.276 (up to 45% short); at most 6 pt 0.182-0.294 (within ~9%), 1.1-1.4 s a scroll.
+if LINK == "ble":
+    SCROLL_MAX = 6.0
 
 
-def scroll_step(remaining):
-    """Points to move this tick when `remaining` points are left of a scroll drag."""
+def scroll_tail_step():
+    """Points per report in a scroll's tail: one unit, or the tail speed's worth per
+    report where a unit moves less (the mirroring phone's table)."""
+    refresh()
+    return max(DRAG_PTS[0][1], SCROLL_TAIL_SPEED * REPORT_PERIOD)
+
+
+def scroll_crawls():
+    """Whether the tail's last points crawl with pauses: only when its step is a
+    single unit already (pauses between bigger reports break the calibration)."""
+    return scroll_tail_step() <= DRAG_PTS[0][1]
+
+
+# A scroll view starts following the finger only once it has moved a few points
+# (touch slop), and the content never makes those up: over Bluetooth LE (iPhone 14 Pro
+# Max, iOS 26.5) scroll-by fell short by 7.5-10 pt whatever the distance (0.05-0.3 of
+# the screen). Scroll drags go that much further. Not measured over Classic (Linux).
+SCROLL_SLOP = 8.0 if LINK == "ble" else 0.0
+
+
+def scroll_step(remaining, most=None):
+    """Points to move this tick when `remaining` points are left of a scroll drag
+    (at most `most`, default SCROLL_MAX)."""
+    step = scroll_tail_step()
     if remaining <= SCROLL_TAIL:
-        return min(remaining, DRAG_PTS[0][1])
-    return min(max(remaining * SCROLL_SHARE, DRAG_PTS[0][1]), SCROLL_MAX)
+        return min(remaining, step)
+    return min(max(remaining * SCROLL_SHARE, step), SCROLL_MAX if most is None else most)
 
 
 def scroll_drag(hid, fx0, fy0, fx1, fy1):
     """Drag from (fx0, fy0) to (fx1, fy1), slowing down at the end, and lift: the
     content moves exactly as far as the finger, with no fling."""
+    dx, dy = (fx1 - fx0) * SCREEN_PT[0], (fy1 - fy0) * SCREEN_PT[1]
+    total = (dx * dx + dy * dy) ** 0.5
+    if total < 0.5:
+        return
+    if SCROLL_SLOP:  # the finger goes further by the slop, so the content moves as asked
+        k = (total + SCROLL_SLOP) / total
+        fx1, fy1 = _clamp(fx0 + (fx1 - fx0) * k), _clamp(fy0 + (fy1 - fy0) * k)
+        dx, dy = (fx1 - fx0) * SCREEN_PT[0], (fy1 - fy0) * SCREEN_PT[1]
+        total = (dx * dx + dy * dy) ** 0.5
     t = Touch(hid)
     t.press(fx0, fy0)
     time.sleep(0.02)
-    dx, dy = (fx1 - fx0) * SCREEN_PT[0], (fy1 - fy0) * SCREEN_PT[1]
-    total = (dx * dx + dy * dy) ** 0.5
     done = 0.0
+    crawls = scroll_crawls()
     while done < total - 0.5:
         done = min(total, done + scroll_step(total - done))
         k = done / total
         t.target = (fx0 + (fx1 - fx0) * k, fy0 + (fy1 - fy0) * k)
         t.step()
-        time.sleep(TICK * (SCROLL_CRAWL_TICKS if total - done < SCROLL_CRAWL else 1))
+        time.sleep(TICK * (SCROLL_CRAWL_TICKS if crawls and total - done < SCROLL_CRAWL else 1))
     for _ in range(10):  # finish any remainder below one report
         if t.step() < 1.0:
             break

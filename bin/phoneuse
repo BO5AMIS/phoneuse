@@ -1,5 +1,15 @@
-#!/usr/bin/env python3
-"""phoneuse launcher: runs the CLI from this checkout (no install step needed)."""
+#!/bin/sh
+""":"
+# phoneuse launcher: runs the CLI from this checkout (no install step needed).
+# This part is sh: it finds a Python (the Windows venv first, for Git Bash), then
+# runs this same file with it; the rest is Python.
+here=$(dirname "$0")
+for py in "$here/../.venv/Scripts/python.exe" python3 python; do
+  if command -v "$py" >/dev/null 2>&1; then exec "$py" "$0" "$@"; fi
+done
+echo "phoneuse: no Python found" >&2
+exit 1
+":"""
 import os
 import sys
 

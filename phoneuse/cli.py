@@ -1,10 +1,14 @@
 #!/usr/bin/python
-"""phoneuse: see and operate an iPhone from a Linux PC.
+"""phoneuse: see and operate an iPhone from a PC (Linux or Windows).
 
 Setup and running:
-  phoneuse install              one-time: Bluetooth HID service (sudo), bluetoothd
-                               config, and the local vision models
+  phoneuse install              one-time setup. Linux: Bluetooth HID service (sudo) and
+                               bluetoothd config. Windows: UxPlay, the firewall rule
+                               (asks for admin once). Both: the local vision models
+  phoneuse doctor               check every part of the setup and say how to fix it
   phoneuse up                   mirror window + mouse control (click/drag on the mirror)
+  phoneuse down                 Windows: also stop the Bluetooth keyboard and mouse, which
+                               keep running after `up` stops (see up_windows)
   phoneuse status               Bluetooth link and mirror window
   phoneuse done                 end the agent session: control goes back to the user
   phoneuse unlock               on the lock screen: ask the owner to approve entering the
@@ -62,47 +66,118 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 
-from . import calibrate, phones, screen, touch
-from .config import CFG, NAME, SCREEN_PT, VISION_SOCKET
+from . import calibrate, config, ipc, phones, screen, touch
+from .config import CFG, IS_WINDOWS, NAME, SCREEN_PT, runtime_path
 from .hidclient import Hid
 
 PKG = os.path.dirname(os.path.realpath(__file__))
 ROOT = os.path.dirname(PKG)  # the repository checkout
+WEB_PORT = int(CFG["web_port"])
 
 PT = SCREEN_PT
-LAST_ACTION = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse-last-action")
-# UxPlay receives AirPlay and passes the phone's H.264 stream on as RTP to the
-# video hub (hub.py), which serves the mirror window and the browser mirror.
-MIRROR_ARGS = ["uxplay", "-p", "-n", NAME, "-nh",  # -nh: no "@hostname" after the name
-               "-vrtp", f"config-interval=1 pt=96 mtu=60000 ! udpsink host=127.0.0.1 port={screen.HUB_RTP_PORT} sync=false",
-               "-vsync", "no", "-s", f"{SCREEN_PT[0] * 3}x{SCREEN_PT[1] * 3}@60", "-fps", "60",
-               # audio: mirrored audio already plays unsynced (-vsync no); keep the sink's
-               # buffer at 40 ms (pulsesink default is up to 200 ms) and ask the phone to
-               # plan for 0.1 s instead of 0.25 s
-               "-as", "pulsesink buffer-time=40000 latency-time=10000", "-al", "0.1"]
+LAST_ACTION = runtime_path("phoneuse-last-action")
+
+
+def uxplay_path():
+    """The AirPlay receiver: `uxplay` on the PATH, or on Windows the MSYS2 build
+    (scripts/windows/build-uxplay.sh), unless config.toml names one."""
+    if CFG.get("uxplay", "auto") != "auto":
+        return CFG["uxplay"]
+    if IS_WINDOWS:
+        for p in (r"C:\msys64\ucrt64\bin\uxplay.exe", shutil.which("uxplay")):
+            if p and os.path.exists(p):
+                return p
+        return None
+    return shutil.which("uxplay") or "uxplay"
+
+
+def device_id():
+    """A fixed AirPlay device ID for this PC (a random, locally administered MAC address,
+    made once). On Windows UxPlay would take the first adapter's MAC, often a Hyper-V
+    or WSL adapter whose address changes, and the iPhone would see a new receiver."""
+    from .config import config_dir
+    path = os.path.join(config_dir(), "airplay-id")
+    try:
+        with open(path) as f:
+            mac = f.read().strip()
+        if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+            return mac
+    except FileNotFoundError:
+        pass
+    b = bytearray(os.urandom(6))
+    b[0] = (b[0] & 0xFC) | 0x02  # unicast, locally administered
+    mac = ":".join(f"{x:02x}" for x in b)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(mac)
+    return mac
+
+
+def mirror_args():
+    """UxPlay receives AirPlay and passes the phone's H.264 stream on as RTP to the
+    video hub (hub.py, avhub.py), which serves the mirror window and the browser mirror.
+    The display size offered is the phone's own screen (read afresh: the phone may have
+    changed since `phoneuse up` started)."""
+    pts, _ = config.screen_points()
+    args = [uxplay_path(), "-p", "-n", NAME, "-nh",  # -p: fixed ports; -nh: no "@hostname" after the name
+            "-vrtp", f"config-interval=1 pt=96 mtu=60000 ! udpsink host=127.0.0.1 port={screen.HUB_RTP_PORT} sync=false",
+            "-vsync", "no", "-s", f"{pts[0] * 3}x{pts[1] * 3}@60", "-fps", "60"]
+    if IS_WINDOWS:
+        args += ["-m", device_id()]
+    # Audio: mirrored audio already plays unsynced (-vsync no); keep the sink's buffer
+    # short and ask the phone to plan for 0.1 s instead of 0.25 s.
+    if not CFG.get("audio", True):
+        return args + ["-a"]
+    sink = "wasapisink low-latency=true" if IS_WINDOWS else "pulsesink buffer-time=40000 latency-time=10000"
+    return args + ["-as", sink, "-al", "0.1"]
+
+
+def uxplay_args():
+    """mirror_args(), with no audio sink while the companion app has turned the
+    mirror's audio off (companion.py: it stops UxPlay, which then starts again)."""
+    from .companion import AUDIO_OFF
+    args = mirror_args()
+    if os.path.exists(AUDIO_OFF) and "-as" in args:
+        i = args.index("-as")
+        args = args[:i] + ["-as", "0"] + args[i + 2:]
+    return args
 
 
 # UxPlay buffers its output when it goes to a pipe; stdbuf makes it line-buffered.
-UNBUFFERED = ["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else []
-UXPLAY_LOG = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse-uxplay.log")
+# (The Windows build turns buffering off itself: scripts/windows/build-uxplay.sh.)
+UNBUFFERED = ["stdbuf", "-oL", "-eL"] if not IS_WINDOWS and shutil.which("stdbuf") else []
+UXPLAY_LOG = runtime_path("phoneuse-uxplay.log")
+MIRRORING_PHONE = runtime_path("mirroring-phone")  # name of the phone that last started mirroring
 SENDER = re.compile(r"connection request from (.+) \((.*)\) with deviceID = (\S+)")
 
 
-def follow_sender(stream):
+# UxPlay lines worth showing in `phoneuse up`'s own output (the rest go to the log).
+NOTABLE = re.compile(r"\*\*\* ERROR|Connection closed|connection request from|Initialized server socket|"
+                     r"mDNS|DNS-SD|failed", re.I)
+
+
+def follow_sender(stream, echo=False):
     """Log UxPlay's output and tell the HID daemon which phone is mirroring, so the
-    Bluetooth mouse and keyboard go to that phone."""
-    with open(UXPLAY_LOG, "a") as log:
+    Bluetooth mouse and keyboard go to that phone. With echo, also print the lines
+    that matter (errors, connections) to this console."""
+    with open(UXPLAY_LOG, "a", encoding="utf-8", errors="replace") as log:
         for line in stream:
             log.write(line)
             log.flush()
+            if echo and NOTABLE.search(line) and not SENDER.search(line):
+                print(time.strftime("%H:%M:%S"), "uxplay:", line.strip(), flush=True)
             m = SENDER.search(line)
             if not m:
                 continue
             print(time.strftime("%H:%M:%S"), f"mirroring: {m[1]} ({m[2]})", flush=True)
             phones.seen(m[1], m[2])
+            try:  # read back by a restarted HID service (Windows)
+                with open(MIRRORING_PHONE, "w", encoding="utf-8") as f:
+                    f.write(m[1])
+            except OSError:
+                pass
+            note_model(m[2])
             try:
                 print(time.strftime("%H:%M:%S"), Hid().cmd("mirror " + m[1]), flush=True)
             except Exception as e:
@@ -138,6 +213,28 @@ def calibrate_when_ready(name, wait=180):
             return
 
 
+def note_model(model):
+    """Remember the mirroring phone's model: its screen size comes from it
+    (config.screen_points). Written only when it changes, because the services that
+    plan gestures and scale screenshots restart when this file does."""
+    if not model or model == config.mirroring_model():
+        return
+    try:
+        with open(config.MODEL_FILE, "w", encoding="utf-8") as f:
+            f.write(model)
+    except OSError:
+        return
+    pts, source = config.screen_points()
+    if source == "config.toml":
+        msg = f"screen: {pts[0]} x {pts[1]} points, from config.toml"
+    elif model in config.MODEL_POINTS:
+        msg = f"screen: {pts[0]} x {pts[1]} points ({model})"
+    else:
+        msg = (f"screen: {model} isn't a model phoneuse knows; assuming {pts[0]} x {pts[1]} points. "
+               f"Set screen_points in {config.config_path()} to your iPhone's screen in points.")
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
@@ -160,7 +257,7 @@ def need_mirror():
             f"to {NAME} on the iPhone (Control Center > Screen Mirroring), then check `phoneuse status`.")
 
 
-LAST_SEEN = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse-last-seen")
+LAST_SEEN = runtime_path("phoneuse-last-seen")
 NOTES = []  # remarks for the agent, printed (CLI) or returned (MCP) with the action
 
 
@@ -196,9 +293,7 @@ def agent_phase(phase):
     "reading" the screen, or "thinking" (its model works out the next step)."""
     import json
     try:
-        urllib.request.urlopen(urllib.request.Request(
-            f"http://127.0.0.1:{CFG['web_port']}/api/agent/phase", data=json.dumps({"phase": phase}).encode(),
-            method="POST", headers={"Content-Type": "application/json"}), timeout=1).close()
+        ipc.http_post(WEB_PORT, "/api/agent/phase", json.dumps({"phase": phase}).encode(), timeout=1)
     except OSError:
         pass
 
@@ -209,18 +304,16 @@ def agent_turn():
     notes when the screen changed since the agent last looked without it acting
     (the user may be using the phone, or something is animating)."""
     import atexit, json
-    if sys.argv[0].endswith("phoneuse"):  # a CLI command: the agent thinks again once it exits
+    # A CLI command (bin/phoneuse, or bin\phoneuse.exe on Windows): the agent thinks
+    # again once it exits.
+    if os.path.basename(sys.argv[0]).lower() in ("phoneuse", "phoneuse.exe"):
         atexit.register(agent_phase, "thinking")
-    req = urllib.request.Request(f"http://127.0.0.1:{CFG['web_port']}/api/agent/act",
-                                 data=json.dumps({"action": ACTION}).encode(), method="POST",
-                                 headers={"Content-Type": "application/json"})
     try:
         # up to 2 minutes when the owner asked to approve each agent session (SessionRequests in web.py)
-        urllib.request.urlopen(req, timeout=130).close()
-    except urllib.error.HTTPError as e:
-        if e.code == 409:
-            die(json.loads(e.read()).get("result", "the user took over the phone; stop and wait"))
-    except OSError:
+        code, body = ipc.http_post(WEB_PORT, "/api/agent/act", json.dumps({"action": ACTION}).encode(), timeout=130)
+        if code == 409:
+            die(json.loads(body).get("result", "the user took over the phone; stop and wait"))
+    except (OSError, ValueError):
         pass  # no browser mirror running: nothing to tell
     try:
         seen_at = os.path.getmtime(LAST_SEEN)
@@ -242,13 +335,15 @@ def hid():
     try:
         h = Hid()
     except OSError:
-        die("Bluetooth HID service isn't running. Run: phoneuse install")
+        die("The Bluetooth HID service isn't running. " + ("It runs with `phoneuse up`." if IS_WINDOWS
+                                                            else "Run: phoneuse install"))
     st = h.cmd("status")
     if "connected=True" not in st:
         try:
             h.cmd("connect")
         except RuntimeError as e:
-            die(f"iPhone not connected over Bluetooth ({e}). On the phone: Settings > Bluetooth > {NAME}.")
+            where = os.environ.get("COMPUTERNAME", "this PC") if IS_WINDOWS else NAME
+            die(f"iPhone not connected over Bluetooth ({e}). On the phone: Settings > Bluetooth > {where}.")
     return AgentHid(h)
 
 
@@ -258,7 +353,6 @@ class DotPoster:
     never waits on the page."""
 
     def __init__(self):
-        self.url = f"http://127.0.0.1:{CFG['web_port']}/api/agent/cursor"
         self.latest = None
         self.event = threading.Event()
         self.lock = threading.Lock()  # guards latest (quick)
@@ -291,8 +385,7 @@ class DotPoster:
         try:
             x, y, down = dot
             body = f'{{"x": {x}, "y": {y}, "down": {str(down).lower()}}}'.encode()
-            req = urllib.request.Request(self.url, data=body, method="POST", headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=0.3).close()
+            ipc.http_post(WEB_PORT, "/api/agent/cursor", body, timeout=0.3)
         except (OSError, ValueError, TypeError):
             pass  # the dot is a courtesy; never slow or fail the action
 
@@ -368,7 +461,13 @@ def settle():
     except (FileNotFoundError, ValueError):
         pass
     try:
-        line, _ = screen.frames_request(f"settle {since}" if since is not None else "settle", timeout=6)
+        # After an action: up to 1.5 s for its first change, then 0.25 s of stillness.
+        # Measured over Bluetooth LE (iPhone 14 Pro Max, iOS 26.5): the Home key's first
+        # change came up to 0.9 s after it, an app launch from Spotlight later still, and
+        # a tap's hover highlight came before its page transition with a short gap, so a
+        # 1 s wait and 0.1 s of stillness returned the old screen.
+        line, _ = screen.frames_request(f"settle {since} 0.25 1.5" if since is not None else "settle",
+                                        timeout=6)
         with open(LAST_SEEN, "w") as f:  # what the agent has now seen (see agent_turn)
             f.write(line.split("seq=")[1].split()[0])
         note = None
@@ -395,7 +494,22 @@ def key_combo(h, combo):
 # ---------- gestures (recipes verified on iOS 26, see RECIPES.md) ----------
 
 def home(h):
-    h.cmd("key h gui")
+    # The Home key (consumer page), not Cmd+H: on the home screen's Today view (the page
+    # left of the first) Cmd+H and Cmd+Space did nothing, and the Home key went home
+    # (iPhone 14 Pro Max, iOS 26.5). Elsewhere both work.
+    h.cmd("consumer home")
+    # An app opened from Spotlight goes back to Spotlight, not to the home screen
+    # (measured: `open Settings`, then Home showed Spotlight's results), so Home again,
+    # a second later: past iOS's double-press window (a double press opens the
+    # switcher), it is another single press. On the home screen it does nothing (or
+    # goes to the first page).
+    time.sleep(1.0)
+    h.cmd("consumer home")
+    # iOS holds a single Home press back ~0.5 s. A read right after waited for "the
+    # first change", and something moving on the old screen counted as one: it
+    # returned the app instead of the home screen. Once the animation runs, a read
+    # waits for it to end.
+    time.sleep(0.6)
 
 
 def back(h):
@@ -445,7 +559,7 @@ def steplog(*a):
         print(f"{time.time():.3f}", *a, file=sys.stderr, flush=True)
 
 
-def step(h, command, quiet=0.1, change=0.6):
+def step(h, command, quiet=0.1, change=1.0):
     """Send one HID command and wait until the phone has shown its result (the
     frames service), instead of a fixed pause. `quiet`: how long the picture
     must stay still, longer where results stream in (search)."""
@@ -478,6 +592,15 @@ def refuse_if_locked():
 SOUNDS = os.path.join(PKG, "sounds")
 
 
+def play_sound(wav):
+    """Play a WAV file on this PC's speakers and wait until it has played."""
+    if IS_WINDOWS:
+        import winsound
+        winsound.PlaySound(wav, winsound.SND_FILENAME)
+    else:
+        subprocess.run(["pw-play", wav], check=True, timeout=15)
+
+
 def cursor_state(h):
     """Is the phone's pointer working (AssistiveTouch on)? Moves the pointer between
     two spots twice (A, B, A, B). With AssistiveTouch on, the pointer is part of
@@ -488,6 +611,11 @@ def cursor_state(h):
     screen keeps changing by itself near the spots."""
     import numpy as np
     spots = [(0.30, 0.42), (0.70, 0.58)]
+    # Wake the pointer first: after a while unused it hides, and it fades back in on the
+    # next move, so the first picture would catch it half-drawn (measured: "off" once,
+    # then "on" twice, with AssistiveTouch on).
+    h.cmd(f"a {spots[1][0]} {spots[1][1]} 0")
+    time.sleep(0.5)
     shots = []
     for x, y in spots + spots:
         h.cmd(f"a {x} {y} 0")
@@ -554,7 +682,7 @@ def cursor_set(h, on):
             if not siri_open(before):
                 continue  # let go (finally) and hold again
             heard = True
-            subprocess.run(["pw-play", wav], check=True, timeout=15)
+            play_sound(wav)
             time.sleep(0.3)
         finally:
             h.cmd("consumer siri up")
@@ -579,59 +707,149 @@ def awake_cmd(arg):
     about once a second while nobody uses the phone, so Auto-Lock never fires."""
     if arg not in (None, "on", "off"):
         die("usage: phoneuse awake [on|off]")
-    url = f"http://127.0.0.1:{CFG['web_port']}/api/awake"
-    data = None if arg is None else json.dumps({"on": arg == "on"}).encode()
-    req = urllib.request.Request(url, data=data, method="GET" if data is None else "POST",
-                                 headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            on = json.load(r)["on"]
-    except OSError as e:
+        if arg is None:
+            _, body = ipc.http_get(WEB_PORT, "/api/awake", timeout=5)
+        else:
+            _, body = ipc.http_post(WEB_PORT, "/api/awake", json.dumps({"on": arg == "on"}).encode(), timeout=5)
+        on = json.loads(body)["on"]
+    except (OSError, ValueError, KeyError) as e:
         die(f"The browser mirror's server isn't running ({e}); start `phoneuse up`.")
     return "keep awake " + ("on" if on else "off")
 
 
 def open_app(h, name):
-    step(h, "key h gui", change=0.3)  # often already home (no change); also wakes a locked phone
+    # Home first (often already there; also wakes a locked phone). iOS holds a single
+    # Home press back ~0.5 s (a double press opens the switcher), and Cmd+Space sent
+    # while an app is still closing is ignored. Waiting for the first change wasn't
+    # enough: a page that was still updating (iPhone Storage) counted as that change,
+    # Cmd+Space went out mid-animation, and the name was typed into nothing. So: wait
+    # out the hold-back, then until the picture has been still for 0.3 s.
+    t_home = time.time()
+    h.cmd("consumer home")
+    time.sleep(0.7)
+    try:
+        screen.frames_request("settle - 0.3 0", timeout=6)
+    except OSError:
+        time.sleep(0.6)
     refuse_if_locked()
-    step(h, "key space gui")
-    step(h, "type " + name, quiet=0.35)  # search results arrive in waves
-    spot = spotlight_app(screen_text(), name)
-    if spot:  # the app is a result, but not the top hit (typing "Gmail" puts Mail first)
-        seq = frame_seq()
-        touch.tap(h, *spot)
-        if seq is not None:
-            try:
-                screen.frames_request(f"settle {seq} 0.3 0.6", timeout=6)  # the app comes up
-                acted(None)
+    if big_change_since(t_home):
+        # An app was closed. The first Spotlight opened after that doesn't take typed
+        # keys (measured: 12 of 12 times the name was lost; the next one always took
+        # it), so open it once and close it before the real one.
+        h.cmd("key space gui")
+        time.sleep(1.0)
+        h.cmd("key escape")
+        time.sleep(0.8)
+    # Measured over Bluetooth LE (iPhone 14 Pro Max, iOS 26.5): Cmd+Space didn't open
+    # Spotlight about one time in four (as one report or Cmd first, after a Home press
+    # or not); with the name typed and the results shown, Enter once left the home
+    # screen. So every step is checked on the screen: Spotlight open (else Escape and
+    # Cmd+Space again), the app among the results (else type it again), and the app
+    # itself is tapped. Without the screen-reading models: the old blind sequence.
+    hit = None
+    for attempt in range(3):
+        if not open_spotlight(h):
+            continue
+        # Spotlight may keep the last search in its field: select it so the name
+        # replaces it. (Appended, "Settings" became "SettingsSettings", no app
+        # matched, and Enter opened Google Maps.)
+        h.cmd("key a gui")
+        step(h, "type " + name, quiet=0.35)  # search results arrive in waves
+        hit = spotlight_hit(name)
+        if hit != "missing":
+            break
+        h.cmd("key escape")
+        time.sleep(0.8)
+    if isinstance(hit, tuple):
+        t_tap = time.time()
+        touch.tap(h, *hit)
+        # The launch changes the whole picture; the pointer's hover highlight on the
+        # result came first and, taken for the launch, ended the wait early.
+        while time.time() - t_tap < 2.5 and not big_change_since(t_tap, frac=0.3):
+            time.sleep(0.1)
+        try:
+            screen.frames_request("settle - 0.3 0", timeout=6)
+        except OSError:
+            time.sleep(1.0)
+    elif hit == "missing":
+        # Never Enter here: the field may still hold the last search, and Enter then
+        # opened that app instead (TestFlight asked, Settings opened).
+        h.cmd("key escape")
+        die(f"'{name}' wasn't among Spotlight's results twice, so nothing was opened. Check the "
+            "app's name as it appears under its icon, or look at the screen.")
+    else:  # the screen can't be read (no models): Enter takes Spotlight's top hit
+        step(h, "key enter", quiet=0.3)
+
+
+SPOTLIGHT_MARKS = ("top hit", "suggestions", "siri suggestions", "show more", "show less")
+
+
+def big_change_since(t0, frac=0.2):
+    """Did the picture change over `frac` of its area since time t0 (frames service
+    history)? False when it can't tell."""
+    import json
+    try:
+        line, _ = screen.frames_request(f"history {t0}", timeout=2)
+        return any(f >= frac for _, f, _ in json.loads(line))
+    except (OSError, ValueError):
+        return False
+
+
+def open_spotlight(h, tries=3):
+    """Cmd+Space until Spotlight is open: 1.6 s later the picture must differ from the
+    one before over most of its area (Spotlight blurs the screen behind its results).
+    Cmd+Space toggles Spotlight, so it is pressed again only when it isn't open."""
+    import numpy as np
+
+    def small():
+        img = screen.grab_rgb()
+        return img[::16, ::16].mean(axis=2)
+
+    for _ in range(tries):
+        try:
+            before = small()
+        except RuntimeError:  # no picture: press and hope
+            h.cmd("key space gui")
+            time.sleep(1.2)
+            return True
+        h.cmd("key space gui")
+        time.sleep(1.0)  # it opens 0.2-0.5 s after the key, then animates
+        after = small()
+        if before.shape == after.shape and float((np.abs(after - before) > 25).mean()) > 0.3:
+            try:  # let it finish opening; its field takes keys only a moment after
+                screen.frames_request("settle - 0.2 0", timeout=6)
             except OSError:
-                time.sleep(0.8)
-    else:
-        step(h, "key enter", quiet=0.3)  # wait for the app to come up
+                pass
+            time.sleep(0.3)
+            return True
+    return False
 
 
 def _plain(text):
     return "".join(c for c in text.casefold() if c.isalnum())
 
 
-def spotlight_app(lines, name):
-    """Where to tap in Spotlight's results to open the app called `name`, or None
-    when Enter already opens it (it is the top hit) or no app has that exact name.
-    The top hit is the first line under the search field; the Apps section lists
-    one app per line, indented, until the next section's header at the left edge."""
-    want = _plain(name)
-    below = [ln for ln in lines if ln[1] > 0.12]
-    if not want or not below or _plain(below[0][2]) == want:
+def spotlight_hit(name):
+    """Where Spotlight lists the app `name`, "missing" when it isn't among the results,
+    None when the screen can't be read (no models). The topmost line that is exactly
+    the name: the top hit's label, or the app in the Apps section when another app is
+    the top hit (typing "Gmail" puts Mail first). Never a near match (Gmail -> Mail).
+    A label cut short ("Google Ma…") counts when it starts the name."""
+    try:
+        lines = screen_text()
+    except SystemExit:
         return None
-    apps = False
-    for x, y, text in below:
-        if _plain(text) == "apps" and x < 0.22:
-            apps = True
-        elif apps and x < 0.22:  # the next section's header
-            return None
-        elif apps and _plain(text) == want:
+    want = _plain(name)
+    results = [(x, y, t) for x, y, t in lines if 0.06 < y < 0.88]  # not the search field at the bottom
+    for x, y, t in results:
+        if _plain(t) == want:
             return x, y
-    return None
+    for x, y, t in results:
+        cut = t.rstrip()
+        if (cut.endswith("…") or cut.endswith("...")) and len(_plain(cut)) >= 4 and want.startswith(_plain(cut)):
+            return x, y
+    return "missing"
 
 
 def type_text(h, text):
@@ -645,7 +863,7 @@ def type_text(h, text):
 
 # ---------- screen ----------
 
-LOOK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse-look.npy")
+LOOK = runtime_path("phoneuse-look.npy")
 
 
 def _small(rgb):
@@ -715,43 +933,44 @@ def screenshot(path):
 
 # ---------- vision (OCR + grounding, see vision.py) ----------
 
-VISION_SOCK = VISION_SOCKET
+VISION_PY = os.path.join(ROOT, ".venv-vision", "Scripts", "python.exe") if IS_WINDOWS else \
+    os.path.join(ROOT, ".venv-vision", "bin", "python")
+VISION_LOG = runtime_path("phoneuse-vision.log")
 
 
 def vision(req, timeout=90):
     import json
-    import socket
 
     def ask():
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(VISION_SOCK)
-        s.sendall((json.dumps(req) + "\n").encode())
-        reply = json.loads(s.makefile().readline())
-        s.close()
-        return reply
+        with ipc.connect("vision", timeout=timeout) as s:
+            s.sendall((json.dumps(req) + "\n").encode())
+            return json.loads(s.makefile("rb").readline())
 
     try:
         return ask()
     except (FileNotFoundError, ConnectionRefusedError):
         pass
-    py = os.path.join(ROOT, ".venv-vision", "bin", "python")
-    if not os.path.exists(py):
-        die(f"Vision models aren't installed. Run: {ROOT}/scripts/setup-vision.sh")
-    logf = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse-vision.log"), "a")
-    subprocess.Popen([py, "-m", "phoneuse.vision"], cwd=ROOT, stdout=logf, stderr=logf, start_new_session=True)
-    for _ in range(120):
+    if not os.path.exists(VISION_PY):
+        die("Vision models aren't installed. Run: " + (r"scripts\windows\setup-vision.ps1" if IS_WINDOWS
+                                                       else f"{ROOT}/scripts/setup-vision.sh"))
+    logf = open(VISION_LOG, "a")
+    if IS_WINDOWS:  # detached, no console window; it outlives this command and keeps the models loaded
+        subprocess.Popen([VISION_PY, "-m", "phoneuse.vision"], cwd=ROOT, stdout=logf, stderr=logf,
+                         stdin=subprocess.DEVNULL, creationflags=0x08000000 | 0x00000200)
+    else:
+        subprocess.Popen([VISION_PY, "-m", "phoneuse.vision"], cwd=ROOT, stdout=logf, stderr=logf, start_new_session=True)
+    for _ in range(240):
         time.sleep(0.5)
         try:
             return ask()
         except (FileNotFoundError, ConnectionRefusedError):
             continue
-    die("vision service didn't start; see $XDG_RUNTIME_DIR/phoneuse-vision.log")
+    die(f"vision service didn't start; see {VISION_LOG}")
 
 
 def fresh_screenshot():
     """A screenshot for reading, once the screen has settled (see settle)."""
-    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), f"phoneuse-shot-{os.getpid()}.png")
+    path = runtime_path(f"phoneuse-shot-{os.getpid()}.png")
     import contextlib, io
     with contextlib.redirect_stdout(io.StringIO()):
         screenshot(path)
@@ -860,6 +1079,68 @@ def find(what):
 # ---------- up / install / status ----------
 
 def up():
+    return up_windows() if IS_WINDOWS else up_linux()
+
+
+HID_LOG = runtime_path("phoneuse-hid.log")
+HID_SOURCES = ("windows/hid.py", "hidproto.py", "ipc.py")
+
+
+def hid_status():
+    """The HID service's status line, or None when it isn't running."""
+    try:
+        return ipc.request("hid", "status", timeout=3)[0]
+    except OSError:
+        return None
+
+
+# Started by a short-lived middle process, so the HID service has no living parent:
+# stopping `phoneuse up` with its process tree (taskkill /T, as tools do) can't reach it.
+_SPAWN = ("import subprocess, sys\n"
+          "log = open(sys.argv[1], 'a', encoding='utf-8')\n"
+          "subprocess.Popen(sys.argv[3:], stdout=log, stderr=log, stdin=subprocess.DEVNULL,"
+          " creationflags=int(sys.argv[2]))\n")
+
+
+def start_hid():
+    """Windows: start the Bluetooth HID service on its own, detached and outside any
+    job, so it outlives `phoneuse up`. A copy that finds one already running exits
+    without touching Bluetooth (windows/hid.py)."""
+    flags = 0x08000000 | 0x00000200  # no window, own process group (Ctrl+C in this console doesn't reach it)
+    # Out of the job this command may itself be in (a terminal's or a tool's that kills
+    # its processes when it closes), when that job allows it.
+    for extra in (0x01000000, 0):  # CREATE_BREAKAWAY_FROM_JOB
+        try:
+            subprocess.Popen([sys.executable, "-c", _SPAWN, HID_LOG, str(flags | extra),
+                              sys.executable, "-u", "-m", "phoneuse.windows.hid"],
+                             cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             env=dict(os.environ, PYTHONUTF8="1"), creationflags=flags | extra).wait(15)
+            return
+        except OSError:
+            if not extra:
+                raise
+
+
+def down():
+    """Stop the Bluetooth keyboard and mouse (Windows; on Linux the systemd service
+    phoneuse-hid owns them). The phone drops it until `phoneuse up` starts it again;
+    an iPhone may then need pairing again (see up_windows)."""
+    if not IS_WINDOWS:
+        die("On Linux the Bluetooth HID service is the systemd service phoneuse-hid: "
+            "sudo systemctl stop phoneuse-hid")
+    if hid_status() is None:
+        print("The Bluetooth HID service isn't running.")
+        return
+    print(ipc.request("hid", "shutdown", timeout=3)[0])
+    for _ in range(20):
+        time.sleep(0.25)
+        if hid_status() is None:
+            print("Stopped. phoneuse up starts it again.")
+            return
+    die("The HID service didn't stop.")
+
+
+def up_linux():
     if subprocess.run(["systemctl", "is-active", "--quiet", "phoneuse-hid"]).returncode != 0:
         die("Bluetooth HID service isn't running. Run: phoneuse install")
     print(f"Starting the mirror (AirPlay receiver '{NAME}'). On the iPhone: Control Center > Screen Mirroring > {NAME}.")
@@ -915,7 +1196,7 @@ def up():
     def keep_frames():
         # The frames service (frames.py): settle and screenshots for agents. It
         # joins the hub as a viewer, so it restarts freely, also on code changes.
-        supervise("frames", "frames service", ["frames.py", "screen.py"])
+        supervise("frames", "frames service", ["frames.py", "screen.py", config.MODEL_FILE])
     threading.Thread(target=keep_frames, daemon=True).start()
 
     def keep_window():
@@ -934,24 +1215,21 @@ def up():
         # The browser mirror (web.py), on localhost only. Restarts when its code
         # changes: it rejoins the hub, so the phone keeps mirroring.
         supervise("web", "browser mirror", ["web.py", "pointer.py", "touch.py", "phones.py", "unlock.py", "screen.py",
-                                            "companion.py", "apns.py", "bridge.py", "bridge_web.py"])
+                                            "companion.py", "apns.py", "bridge.py", "bridge_web.py", config.MODEL_FILE])
     threading.Thread(target=keep_web, daemon=True).start()
 
     def keep_mirror():
         # If UxPlay dies, start it again so the phone can reconnect without
         # restarting `phoneuse up`. The companion app turns the audio off or on by
         # changing the audio-off file and stopping UxPlay (companion.py).
-        from .companion import AUDIO_OFF, UXPLAY_PID
+        from .companion import UXPLAY_PID
         while not stop.is_set():
-            args = MIRROR_ARGS
-            if os.path.exists(AUDIO_OFF):
-                i = MIRROR_ARGS.index("-as")
-                args = MIRROR_ARGS[:i] + ["-as", "0"] + MIRROR_ARGS[i + 2:]
+            args = uxplay_args()
             env = dict(os.environ)
             out = subprocess.DEVNULL
             if os.environ.get("PHONEUSE_TRACE"):  # per-element GStreamer latency, for tuning
                 env.update(GST_TRACERS="latency(flags=pipeline+element)", GST_DEBUG="GST_TRACER:7")
-                out = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse-gst-trace.log"), "w")
+                out = open(runtime_path("phoneuse-gst-trace.log"), "w")
             if out is subprocess.DEVNULL:  # read UxPlay's output for the sender's name
                 procs["mirror"] = subprocess.Popen(UNBUFFERED + args, stdout=subprocess.PIPE,
                                                    stderr=subprocess.STDOUT, env=env, text=True, errors="replace")
@@ -978,8 +1256,9 @@ def up():
         print(f"Browser mirror: http://localhost:{CFG['web_port']}")
         # The clicker runs as its own process and restarts by itself when its code
         # changes, so edits don't drop the AirPlay connection.
-        watched = [os.path.join(PKG, f) for f in ("mirror_input.py", "pointer.py", "touch.py", "screen.py", "hidclient.py")]
-        mtimes = lambda: [os.path.getmtime(f) for f in watched]
+        watched = [os.path.join(PKG, f) for f in ("mirror_input.py", "pointer.py", "touch.py", "screen.py",
+                                                  "hidclient.py", config.MODEL_FILE)]
+        mtimes = lambda: [os.path.getmtime(f) for f in watched if os.path.exists(f)]
         while not stop.is_set():
             seen = mtimes()
             procs["clicker"] = subprocess.Popen([sys.executable, "-m", "phoneuse.mirror_input"], cwd=ROOT)
@@ -1009,7 +1288,202 @@ def up():
                     p.kill()
 
 
+def up_windows():
+    """Windows: the video hub, the frames service, the browser mirror and UxPlay, each
+    restarted when it exits (frames and the browser mirror also when their code
+    changes); the mirror opens in a window of its own. They are in a job object, so all
+    of them stop with this command. The Bluetooth HID service (Bluetooth LE) is
+    started if it isn't running and keeps running after this command stops
+    (keep_hid; `phoneuse down` stops it)."""
+    from .windows import appwindow
+    from .windows import procs as wprocs
+    if not wprocs.single_instance("phoneuse-up"):
+        die("phoneuse up is already running on this PC (it owns the AirPlay and Bluetooth services).")
+    ux = uxplay_path()
+    if not ux:
+        die("UxPlay (the AirPlay receiver) isn't installed. Run scripts\\windows\\install.ps1, "
+            "or `phoneuse doctor` to see what is missing.")
+    job = wprocs.Job()
+    stop = threading.Event()
+    procs = {}
+
+    def say(*a):
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+    def keep(name, label, start, watch=()):
+        """Run a service and start it again when it exits, backing off when it keeps
+        failing; with `watch`, also when one of those source files changes."""
+        files = [os.path.join(PKG, f) for f in watch]
+        mtimes = lambda: [os.path.getmtime(f) for f in files if os.path.exists(f)]
+        fails = 0
+        while not stop.is_set():
+            seen, started = mtimes(), time.time()
+            try:
+                p = procs[name] = start()
+            except OSError as e:
+                say(f"{label} can't start: {e}")
+                stop.wait(10)
+                continue
+            while p.poll() is None and not stop.is_set():
+                stop.wait(1)
+                if files and mtimes() != seen:
+                    say(f"{label} code changed; restarting it")
+                    p.terminate()
+                    p.wait(5)
+                    break
+            else:
+                if stop.is_set():
+                    break
+                fails = fails + 1 if time.time() - started < 15 else 0
+                delay = min(30, 2 ** min(fails, 5))
+                say(f"{label} exited ({p.returncode}); starting it again in {delay} s")
+                stop.wait(delay)
+
+    def module(name):
+        env = dict(os.environ, PYTHONUTF8="1")  # logs may hold any text (phone names, OCR)
+        return lambda: job.popen([sys.executable, "-u", "-m", f"phoneuse.{name}"], cwd=ROOT,
+                                 stdin=subprocess.DEVNULL, env=env)
+
+    def uxplay():
+        env = dict(os.environ)
+        env["PATH"] = os.path.dirname(ux) + os.pathsep + env.get("PATH", "")  # its DLLs and GStreamer
+        p = job.popen(uxplay_args(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                      env=env, text=True, encoding="utf-8", errors="replace")
+        threading.Thread(target=follow_sender, args=(p.stdout,), kwargs={"echo": True}, daemon=True).start()
+        from .companion import UXPLAY_PID
+        try:  # the companion app's audio switch stops UxPlay by this pid
+            with open(UXPLAY_PID, "w") as f:
+                f.write(str(p.pid))
+        except OSError:
+            pass
+        return p
+
+    # The Bluetooth HID service isn't one of this command's services: it runs on its own
+    # and outlives it (keep_hid). Each start publishes its GATT services anew, and an
+    # iPhone that was connected while they disappeared and came back can keep using a
+    # stale copy of them and stop using the keyboard and mouse until it is paired again
+    # (measured on an iPhone 14 Pro Max; Bluetooth off/on on either side didn't help).
+    # The hub stays up while you edit code: a hub restart needs Screen Mirroring started
+    # again. The frames service and the browser mirror restart freely, also when a
+    # phone of another model starts mirroring (config.MODEL_FILE: its screen size).
+    services = [
+        ("hub", "video hub", module("avhub"), ()),
+        ("frames", "frames service", module("frames"), ("frames.py", "screen.py", "ipc.py", config.MODEL_FILE)),
+        ("web", "browser mirror", module("web"),
+         ("web.py", "pointer.py", "touch.py", "phones.py", "unlock.py", "screen.py", "companion.py", "apns.py",
+          "bridge.py", "bridge_web.py", config.MODEL_FILE)),
+    ]
+    say(f"Starting phoneuse. AirPlay receiver: {NAME}; Bluetooth keyboard and mouse: "
+        f"{os.environ.get('COMPUTERNAME', 'this PC')}. Ctrl+C stops it; the Bluetooth keyboard "
+        "and mouse keep running (phoneuse down stops them).")
+
+    def follow_hid_log():
+        # The HID service's output, in this console like the other services'.
+        with open(HID_LOG, "a+", encoding="utf-8", errors="replace") as f:
+            f.seek(0, os.SEEK_END)
+            while not stop.is_set():
+                line = f.readline()
+                if line:
+                    print(line.rstrip("\n"), flush=True)
+                else:
+                    stop.wait(0.3)
+
+    def keep_hid():
+        st = hid_status()
+        if st is not None:
+            started = float(st.split("started=")[1].split()[0]) if "started=" in st else 0.0
+            newest = max(os.path.getmtime(os.path.join(PKG, f)) for f in HID_SOURCES)
+            say("Bluetooth HID service: already running" + (
+                "; its code is older than the checkout (`phoneuse down`, then `phoneuse up`, updates it; "
+                "an iPhone may need pairing again after that)" if newest > started else ""))
+        while not stop.is_set():
+            if hid_status() is None:
+                say("starting the Bluetooth HID service")
+                start_hid()
+                stop.wait(10)  # binding and publishing take a few seconds
+            stop.wait(3)
+
+    threading.Thread(target=follow_hid_log, daemon=True).start()
+    threading.Thread(target=keep_hid, daemon=True).start()
+    for name, label, start, watch in services:
+        threading.Thread(target=keep, args=(name, label, start, watch), daemon=True).start()
+    time.sleep(1.0)  # the hub listens before UxPlay sends it anything
+    threading.Thread(target=keep, args=("uxplay", "AirPlay receiver (UxPlay)", uxplay), daemon=True).start()
+
+    def warm_vision():
+        # The screen-reading models load as soon as phoneuse starts, not on an
+        # agent's first look. Skipped if they aren't installed.
+        if os.path.exists(VISION_PY):
+            try:
+                import contextlib, io
+                with contextlib.redirect_stderr(io.StringIO()):
+                    vision({"op": "ping"}, timeout=180)
+            except SystemExit:
+                pass
+    threading.Thread(target=warm_vision, daemon=True).start()
+
+    def first_status():
+        url = f"http://localhost:{WEB_PORT}/"
+        for _ in range(40):
+            try:
+                ipc.http_get(WEB_PORT, "/")
+                break
+            except OSError:
+                time.sleep(0.25)
+        try:
+            st = Hid().cmd("status")
+            say("Bluetooth:", "connected to " + st.split("peer=")[1].split(" connected_phones")[0]
+                if "connected=True" in st else
+                f"waiting for the iPhone. First time: on the iPhone, Settings > Bluetooth > "
+                f"{os.environ.get('COMPUTERNAME', 'this PC')}.")
+        except (OSError, RuntimeError) as e:
+            say("Bluetooth:", e)
+        say(f"Mirror: {url} . On the iPhone: Control Center > Screen Mirroring > {NAME}.")
+        from . import doctor
+        fw = doctor.firewall_state(ux)
+        if fw in ("block", "missing"):
+            say(("Windows Firewall blocks UxPlay" if fw == "block" else "No Windows Firewall rule for UxPlay")
+                + f": the iPhone won't see {NAME}. Fix it once, " + doctor.FIREWALL_FIX.format(ux=ux))
+        if CFG.get("app_window", True) and not appwindow.open_window(url):
+            import webbrowser
+            webbrowser.open(url)
+    threading.Thread(target=first_status, daemon=True).start()
+
+    try:
+        while not stop.is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        say("stopping")
+    finally:
+        stop.set()
+        for name in ("uxplay", "web", "frames", "hub"):
+            p = procs.get(name)
+            if p and p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+
+
 def status():
+    if IS_WINDOWS:
+        try:
+            st = Hid().cmd("status").replace("ok ", "")
+            print("HID service: active")
+            print("Bluetooth:", st)
+        except OSError:
+            print("HID service: not running (start `phoneuse up`)")
+        try:
+            line, _ = screen.hub_request("status", timeout=2)
+            print("Video hub:", line.replace("ok ", ""))
+        except OSError:
+            print("Video hub: not running (start `phoneuse up`)")
+        live = screen.mirror_live()
+        print("Mirror:", "showing the phone" if live else
+              f"not mirroring (input to the phone is off). On the iPhone: Control Center > Screen Mirroring > {NAME}")
+        print(f"Browser mirror: http://localhost:{WEB_PORT}")
+        return
     svc = subprocess.run(["systemctl", "is-active", "phoneuse-hid"], capture_output=True, text=True).stdout.strip()
     print("HID service:", svc)
     if svc == "active":
@@ -1023,24 +1497,27 @@ def status():
 
 
 def view(print_only):
-    """The browser mirror's address; opens it in the default browser unless print_only."""
-    url = f"http://localhost:{CFG['web_port']}"
+    """The browser mirror's address; opens it (Windows: in its own window) unless print_only."""
+    url = f"http://localhost:{WEB_PORT}"
     try:
-        urllib.request.urlopen(url, timeout=2).close()
+        ipc.http_get(WEB_PORT, "/")
     except OSError:
         die(f"The browser mirror isn't running at {url}. Start `phoneuse up`.")
     if not print_only:
-        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if IS_WINDOWS:
+            from .windows import appwindow
+            if not appwindow.open_window(url + "/"):
+                os.startfile(url)
+        else:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print(url)
 
 
 def agent_done():
     """End the agent's session: the browser mirror stops glowing and its mouse and
     keyboard reach the phone again, at once (not after 20 idle seconds)."""
-    req = urllib.request.Request(f"http://127.0.0.1:{CFG['web_port']}/api/agent/done", data=b"{}", method="POST",
-                                 headers={"Content-Type": "application/json"})
     try:
-        urllib.request.urlopen(req, timeout=2).close()
+        ipc.http_post(WEB_PORT, "/api/agent/done")
     except OSError:
         pass
     print("ok: session ended; control is back with the user")
@@ -1052,12 +1529,10 @@ def app_cmd(args):
     import json
     if args[:1] != ["pair"]:
         die("usage: phoneuse app pair [--print]")
-    req = urllib.request.Request(f"http://127.0.0.1:{CFG['web_port']}/api/companion/pair", data=b"{}",
-                                 method="POST", headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            link = json.loads(r.read())["link"]
-    except OSError as e:
+        _, body = ipc.http_post(WEB_PORT, "/api/companion/pair", timeout=5)
+        link = json.loads(body)["link"]
+    except (OSError, ValueError, KeyError) as e:
         die(f"The browser mirror didn't answer ({e}). Is `phoneuse up` running?")
     if "--print" in args:
         return print(link)
@@ -1074,19 +1549,27 @@ def unlock_cmd():
     """Ask the owner to unlock the phone with the saved passcode. Waits for their
     answer (up to 2 minutes); the passcode never passes through here."""
     import json
-    req = urllib.request.Request(f"http://127.0.0.1:{CFG['web_port']}/api/unlock", data=b"{}", method="POST",
-                                 headers={"Content-Type": "application/json"})
     print("Asked the owner to approve an unlock (browser mirror or notification); waiting...", flush=True)
     try:
-        with urllib.request.urlopen(req, timeout=150) as r:
-            print(json.loads(r.read())["result"])
-    except urllib.error.HTTPError as e:
-        die(json.loads(e.read()).get("result", str(e)))
+        code, body = ipc.http_post(WEB_PORT, "/api/unlock", timeout=150)
     except OSError as e:
         die(f"The browser mirror isn't running ({e}). Start `phoneuse up`.")
+    try:
+        result = json.loads(body).get("result", "")
+    except ValueError:
+        result = body.decode(errors="replace")
+    if code >= 400:
+        die(result or f"HTTP {code}")
+    print(result)
 
 
 def main():
+    if IS_WINDOWS:  # agents read our output through pipes: UTF-8, never the console's code page
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
     a = sys.argv[1:]
     if not a or a[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -1099,6 +1582,12 @@ def main():
     then_text = bool(args) and args[-1] == "--text" and cmd not in ("text", "find", "screenshot")
     if then_text:
         args = args[:-1]
+    if cmd == "install" and IS_WINDOWS:
+        sys.exit(subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                 os.path.join(ROOT, "scripts", "windows", "install.ps1")] + args).returncode)
+    if cmd == "doctor":
+        from . import doctor
+        sys.exit(doctor.main(args))
     if cmd == "install":
         subprocess.run(["sudo", os.path.join(ROOT, "scripts", "install.sh")], check=True)
         if not os.path.exists(os.path.join(ROOT, ".venv-vision")):
@@ -1112,6 +1601,8 @@ def main():
         return up()
     if cmd == "app":  # app pair: pair the companion app (docs/COMPANION.md)
         return app_cmd(args)
+    if cmd == "down":
+        return down()
     if cmd == "status":
         return status()
     if cmd == "unlock":
@@ -1133,7 +1624,7 @@ def main():
         return
     if cmd == "screenshot":
         paths = [x for x in args if not x.startswith("--")]  # (--keep-pointer: now always)
-        return screenshot(paths[0] if paths else os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phoneuse.png"))
+        return screenshot(paths[0] if paths else runtime_path("phoneuse.png"))
     force = "--force" in args
     args = [a for a in args if a != "--force"]
     if cmd in ("tap", "longpress", "swipe") and not force and len(args) >= 2:

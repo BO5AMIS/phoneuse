@@ -43,53 +43,13 @@ HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
 PROFILE_PATH = "/io/phoneuse/hid/profile"
 AGENT_PATH = "/io/phoneuse/hid/agent"
 
-# Report 1: boot-style keyboard (mods, reserved, 6 keys). Report 2: mouse (buttons, x, y, wheel).
-REPORT_MAP = bytes.fromhex(
-    "05010906a1018501050719e029e71500250175019508810295017508810395067508150025650507190029658100c0"
-    +"05010902a10185020901a1000509190129031500250195037501810295017505810305010930093109381581257f750895038106c0c0"
-    # Report 3: absolute pointer (buttons, X and Y 0..32767). Experimental: tests
-    # whether iOS will place the AssistiveTouch pointer at exact coordinates.
-    + "05010902a10185030901a1000509190129031500250195037501810295017505810305010930093115002"
-    "6ff7f751095028102c0c0"
-    # Report 4: consumer control, one bit per key (CONSUMER_KEYS, in this order).
-    + "050c0901a10185041500250175019501"
-    + "09b88102" "09cf8102" "09408102" "0a21028102"  # Eject, Voice Command, Menu, AC Search
-    + "95048103c0"
+from .hidproto import (  # noqa: E402
+    BUTTONS, CHARS, CONSUMER_KEYS, MODS, NAMED, REPORT_MAP, AbsoluteNudge, absolute, passive,
 )
-
-# Consumer keys, by bit of report 4. Eject shows or hides the on-screen keyboard while
-# a hardware keyboard (this one) is connected; Voice Command is the Siri key; Menu
-# goes home; AC Search opens Spotlight.
-CONSUMER_KEYS = {"eject": 0, "siri": 1, "home": 2, "search": 3}
 
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
-
-
-# ---------- key tables (US layout) ----------
-MODS = {"ctrl": 0x01, "shift": 0x02, "alt": 0x04, "gui": 0x08, "cmd": 0x08,
-        "rctrl": 0x10, "rshift": 0x20, "ralt": 0x40, "rgui": 0x80}
-NAMED = {"enter": 40, "return": 40, "esc": 41, "escape": 41, "backspace": 42, "tab": 43,
-         "space": 44, "right": 79, "left": 80, "down": 81, "up": 82, "delete": 76,
-         "home": 74, "end": 77, "pageup": 75, "pagedown": 78}
-CHARS = {}
-for i, c in enumerate("abcdefghijklmnopqrstuvwxyz"):
-    CHARS[c] = (4 + i, 0)
-    CHARS[c.upper()] = (4 + i, 0x02)
-for i, c in enumerate("1234567890"):
-    CHARS[c] = (30 + i, 0)
-for i, c in enumerate("!@#$%^&*()"):
-    CHARS[c] = (30 + i, 0x02)
-for plain, shifted, code in [("-", "_", 45), ("=", "+", 46), ("[", "{", 47), ("]", "}", 48),
-                             ("\\", "|", 49), (";", ":", 51), ("'", '"', 52), ("`", "~", 53),
-                             (",", "<", 54), (".", ">", 55), ("/", "?", 56)]:
-    CHARS[plain] = (code, 0)
-    CHARS[shifted] = (code, 0x02)
-CHARS[" "] = (44, 0)
-CHARS["\n"] = (40, 0)
-CHARS["\t"] = (43, 0)
-BUTTONS = {"left": 1, "right": 2, "middle": 4}
 
 
 # While set, input goes through the ESP32 bridge (phoneuse/bridge.py) over Wi-Fi
@@ -105,6 +65,7 @@ class HID:
         self.peer = None
         self.buttons = 0
         self.consumer_bits = 0
+        self.nudge = AbsoluteNudge()
         self.lock = threading.Lock()
 
     @property
@@ -149,6 +110,9 @@ class HID:
                 reconnect_now.set()
                 raise RuntimeError("no iPhone connected, reconnecting")
             try:
+                for extra in self.nudge.before(report_id, payload):  # see hidproto.AbsoluteNudge
+                    self.intr.send(bytes([0xA1, report_id]) + bytes(extra))
+                    time.sleep(0.008)
                 self.intr.send(bytes([0xA1, report_id]) + bytes(payload))
             except OSError as e:
                 self.drop(f"send failed: {e}")
@@ -667,31 +631,6 @@ def setup_dbus():
 
 
 # ---------- command socket ----------
-def passive(cmd, args):
-    """Reports that change nothing on the phone by themselves: hovers, motion
-    without a button, all keys up. While released they are dropped instead of
-    reconnecting, so moving the mouse over the mirror doesn't bring the
-    keyboard back."""
-    try:
-        if cmd == "a":
-            return len(args) < 3 or int(args[2]) == 0
-        if cmd in ("m", "md"):
-            return (len(args) < 3 or int(args[2]) == 0) and (len(args) < 4 or int(args[3]) == 0)
-        if cmd == "k":
-            return int(args[0]) == 0 and not any(int(c) for c in args[1:])
-        if cmd == "consumer":
-            return args[-1:] == ["up"]
-    except ValueError:
-        return False
-    return cmd in ("move", "corner", "up")
-
-
-def absolute(fx, fy, buttons):
-    """Report 3 payload: buttons, then x and y as 0..32767."""
-    x, y = (max(0, min(32767, round(float(v) * 32767))) for v in (fx, fy))
-    return [buttons & 0x07, x & 0xFF, x >> 8, y & 0xFF, y >> 8]
-
-
 def release(idle):
     with connect_lock:
         if time.time() - last_use[0] < idle:

@@ -5,7 +5,8 @@
 > one setup: an iPhone 17 Pro, Arch Linux, Hyprland and an NVIDIA GPU. Other setups
 > will likely need fixes.
 
-phoneuse lets a Linux PC see and operate an unmodified iPhone. The iPhone sends its
+phoneuse lets a Linux PC, or a Windows PC ([On Windows](#on-windows)), see and
+operate an unmodified iPhone. The iPhone sends its
 screen to the PC over AirPlay, and the PC sends taps and keystrokes to the iPhone as
 a Bluetooth mouse and keyboard. The PC can do that with its own Bluetooth adapter or
 through a small ESP32 bridge that you leave next to the phone. You can use the mirror
@@ -19,7 +20,7 @@ phoneuse uses two features that every iPhone has: Screen Mirroring and Assistive
 
 | | Tested with |
 |---|---|
-| iPhone | iPhone 17 Pro, iOS 26 (for other models, set `screen_points`) |
+| iPhone | iPhone 17 Pro, iOS 26 (phoneuse takes the screen size from the model) |
 | Linux with BlueZ | Arch Linux, BlueZ 5.87 |
 | Hyprland | 0.56 |
 | UxPlay | 1.73.7 |
@@ -93,6 +94,61 @@ and how long a message takes to reach the bridge and come back. When the phone
 disconnects, the bridge reconnects to it by itself. [docs/BRIDGE.md](docs/BRIDGE.md)
 describes the protocol.
 
+## On Windows
+
+Windows can't act as a Bluetooth Classic keyboard, so on Windows phoneuse is a
+Bluetooth LE keyboard and mouse instead (HID over GATT, through the Windows
+Runtime). It uses the PC's own Bluetooth adapter, needs no driver and no admin
+rights, and Windows keeps using the adapter for everything else. The mirror window is
+the browser mirror in a window of its own.
+
+| | Tested with |
+|---|---|
+| Windows | Windows 11 |
+| iPhone | iPhone 17 Pro Max and iPhone 14 Pro Max, iOS 26 |
+| Python | 3.13, from python.org |
+| UxPlay | 1.74, built in MSYS2 by the installer |
+| Edge or Chrome | the mirror window |
+| NVIDIA GPU (optional) | NVENC for the video hub, CUDA for the models that read the screen |
+
+1. **Install**, from the checkout, in PowerShell:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\windows\install.ps1
+   ```
+   The installer makes `.venv`, installs MSYS2 to `C:\msys64` and builds UxPlay there,
+   adds a Windows Firewall rule for UxPlay (it asks for admin rights once; the rule
+   allows the local network only), puts `bin` on your PATH and downloads the models
+   that read the screen (`-NoVision` skips them). It ends with `phoneuse doctor`,
+   which checks each part and says how to fix what is missing.
+2. **Start phoneuse:** run `phoneuse up`. The mirror window opens. Then, on the
+   iPhone, open Control Center, tap Screen Mirroring and choose **PhoneUse**.
+3. **Pair**, once: on the iPhone, open Settings › Bluetooth and tap this PC's Windows
+   name, such as `DESKTOP-…` (Windows doesn't let phoneuse choose its Bluetooth LE
+   name). Confirm on the phone, and on Windows if it asks.
+4. **Turn on the pointer** as on Linux. The first time, phoneuse measures the phone's
+   pointer: over Bluetooth LE every phone needs that measurement.
+
+How it differs from Linux:
+
+- In the mirror window, Ctrl works as Cmd: the Windows key belongs to the Start menu.
+- The Bluetooth keyboard and mouse run as a background service that keeps running
+  when `phoneuse up` stops, and the next `phoneuse up` uses it again. Each time the
+  service starts, the iPhone sees its Bluetooth services disappear and come back, and
+  one iPhone stopped using them until it was paired again. `phoneuse down` stops it.
+- Pair only the phone that phoneuse should control. Over Bluetooth LE, iOS may give
+  its name as just "iPhone", so when two paired phones are connected phoneuse can't
+  tell which one is mirroring, and it sends nothing.
+- A motherboard's Wi-Fi and Bluetooth card needs its antennas, even if the PC uses
+  Ethernet. Without them the phone was heard at about -90 dBm next to the PC, the
+  link dropped several times an hour, and keys and taps sent during a drop were lost.
+- The phone takes a report every 15 ms over Bluetooth LE instead of every 8 ms, and
+  the mirror trails the phone by about 0.1 s, so by hand it feels slower than on
+  Linux. Agents don't notice.
+- The bridge hasn't been tried on Windows.
+
+Logs are in `%LOCALAPPDATA%\phoneuse\run`. For agents, `bin\phoneuse-mcp.exe` is the
+MCP server: `claude mcp add --scope user phoneuse C:\path\to\phoneuse\bin\phoneuse-mcp.exe`.
+
 ## Using it
 
 **The mirror window:** the phone's pointer follows your mouse. Click to tap, drag to
@@ -132,14 +188,21 @@ claude mcp add --scope user phoneuse ~/phoneuse/bin/phoneuse-mcp
 
 ## Configuration
 
-These settings are optional and go in `~/.config/phoneuse/config.toml`:
+These settings are optional and go in `~/.config/phoneuse/config.toml`
+(on Windows, `%APPDATA%\phoneuse\config.toml`):
 
 ```toml
 name = "PhoneUse"             # the Bluetooth and AirPlay name; rerun phoneuse install after changing it
-screen_points = [402, 874]    # the iPhone's screen size in points
+screen_points = "auto"        # the iPhone's screen size in points, such as [402, 874];
+                              # auto: from the model of the phone that last mirrored
 decoder = "auto"              # the GStreamer H.264 decoder
 mirror_width = 498            # the mirror window's width
 web_port = 8777               # the browser mirror's port
+# Windows only:
+encoder = "auto"              # the video hub's encoder: h264_nvenc, libx264 or h264_mf
+uxplay = "auto"               # path to uxplay.exe (auto: C:\msys64\ucrt64\bin)
+app_window = true             # phoneuse up opens the mirror in a window of its own
+service_port = 47810          # the first of four local ports phoneuse's services use
 ```
 
 ## More
