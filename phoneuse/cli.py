@@ -719,37 +719,27 @@ def awake_cmd(arg):
 
 
 def open_app(h, name):
-    # Home first (often already there; also wakes a locked phone). iOS holds a single
-    # Home press back ~0.5 s (a double press opens the switcher), and Cmd+Space sent
-    # while an app is still closing is ignored. Waiting for the first change wasn't
-    # enough: a page that was still updating (iPhone Storage) counted as that change,
-    # Cmd+Space went out mid-animation, and the name was typed into nothing. So: wait
-    # out the hold-back, then until the picture has been still for 0.3 s.
-    t_home = time.time()
-    h.cmd("consumer home")
-    time.sleep(0.7)
+    # The home screen first (also wakes a locked phone), with Home pressed twice
+    # (home()): an app opened from Spotlight goes back to Spotlight on the first press
+    # (measured, iPhone 14 Pro Max, iOS 26.5: 4 of 4). Typing into that Spotlight was
+    # lost, and Cmd+Space, meant to open Spotlight, closed it instead. After two
+    # presses the home screen showed and the next Spotlight took the name, 6 of 6.
+    home(h)
     try:
         screen.frames_request("settle - 0.3 0", timeout=6)
     except OSError:
         time.sleep(0.6)
     refuse_if_locked()
-    if big_change_since(t_home):
-        # An app was closed. The first Spotlight opened after that doesn't take typed
-        # keys (measured: 12 of 12 times the name was lost; the next one always took
-        # it), so open it once and close it before the real one.
-        h.cmd("key space gui")
-        time.sleep(1.0)
-        h.cmd("key escape")
-        time.sleep(0.8)
-    # Measured over Bluetooth LE (iPhone 14 Pro Max, iOS 26.5): Cmd+Space didn't open
-    # Spotlight about one time in four (as one report or Cmd first, after a Home press
-    # or not); with the name typed and the results shown, Enter once left the home
-    # screen. So every step is checked on the screen: Spotlight open (else Escape and
-    # Cmd+Space again), the app among the results (else type it again), and the app
-    # itself is tapped. Without the screen-reading models: the old blind sequence.
-    hit = None
+    try:  # what "Spotlight open" is measured against
+        at_home = _thumb()
+    except RuntimeError:
+        at_home = None
+    # Every step is checked on the screen: Spotlight open (else Cmd+Space again), the
+    # app among the results (else type it again), the app's icon tapped, the app up.
+    # Without the screen-reading models: the old blind sequence (Enter).
+    hit, up = "closed", False
     for attempt in range(3):
-        if not open_spotlight(h):
+        if not up and not open_spotlight(h, at_home):
             continue
         # Spotlight may keep the last search in its field: select it so the name
         # replaces it. (Appended, "Settings" became "SettingsSettings", no app
@@ -757,66 +747,103 @@ def open_app(h, name):
         h.cmd("key a gui")
         step(h, "type " + name, quiet=0.35)  # search results arrive in waves
         hit = spotlight_hit(name)
-        if hit != "missing":
+        if hit is None or isinstance(hit, tuple):
             break
+        if hit == "missing":
+            h.cmd("key escape")
+            time.sleep(0.8)
+            up = False
+        else:
+            # Spotlight is up without results: the name was lost. Right after an app
+            # closed, the first Spotlight sometimes took no keys for a moment (after
+            # Calendar, 2 of 5 times); typed again 0.5 s later, it took them (2 of 2).
+            # Cmd+Space would close it.
+            up = _differs(at_home)
+            time.sleep(0.5)
+    if hit is None:  # the screen can't be read (no models): Enter takes Spotlight's top hit
+        step(h, "key enter", quiet=0.3)
+        return
+    # Never Enter after a miss: the field may still hold the last search, and Enter
+    # then opened that app instead (TestFlight asked, Settings opened).
+    if hit == "missing":
         h.cmd("key escape")
-        time.sleep(0.8)
-    if isinstance(hit, tuple):
+        die(f"'{name}' wasn't among Spotlight's results, so nothing was opened. Check the "
+            "app's name as it appears under its icon, or look at the screen.")
+    if hit == "closed":
+        die(f"Spotlight didn't show its results after Cmd+Space, three times, so '{name}' wasn't "
+            "opened. Look at the screen.")
+    for _ in range(2):
+        try:
+            results = _thumb()
+        except RuntimeError:
+            results = None
         t_tap = time.time()
         touch.tap(h, *hit)
-        # The launch changes the whole picture; the pointer's hover highlight on the
-        # result came first and, taken for the launch, ended the wait early.
-        while time.time() - t_tap < 2.5 and not big_change_since(t_tap, frac=0.3):
+        # The app replaces Spotlight's results: wait for the picture to differ from them
+        # over most of its area. (The pointer's hover highlight on the result came
+        # first, and taken for the launch it ended the wait early. Frame-to-frame
+        # changes don't work either: the launch's zoom spreads over many frames.)
+        launched = False
+        while time.time() - t_tap < 2.5 and not launched:
             time.sleep(0.1)
+            launched = _differs(results)
         try:
             screen.frames_request("settle - 0.3 0", timeout=6)
         except OSError:
             time.sleep(1.0)
-    elif hit == "missing":
-        # Never Enter here: the field may still hold the last search, and Enter then
-        # opened that app instead (TestFlight asked, Settings opened).
-        h.cmd("key escape")
-        die(f"'{name}' wasn't among Spotlight's results twice, so nothing was opened. Check the "
-            "app's name as it appears under its icon, or look at the screen.")
-    else:  # the screen can't be read (no models): Enter takes Spotlight's top hit
-        step(h, "key enter", quiet=0.3)
+        if launched:
+            return
+        again = spotlight_hit(name)
+        if again in ("closed", None):
+            return  # Spotlight is gone
+        if again == "missing":
+            break
+        hit = again  # still there: the tap was lost (it happens over LE), once more
+    die(f"Tapped '{name}' in Spotlight's results, but the app didn't open. Look at the screen.")
 
 
-SPOTLIGHT_MARKS = ("top hit", "suggestions", "siri suggestions", "show more", "show less")
+# Section titles that only Spotlight shows: lines read without one aren't Spotlight's
+# results (the home screen's own icon labels matched an app's name once).
+SPOTLIGHT_MARKS = ("top hit", "suggestions", "siri suggestions", "search in app", "show more", "show less")
+# Spotlight's top hit is an app's icon with its name under it. A tap on the name did
+# nothing for some apps (Weather: 3 of 4 times, and a second tap too); a tap on the
+# icon opened every app tried (iPhone 14 Pro Max, iOS 26.5). There the name was
+# 119 pt under the "Top Hit" title and the icon's middle 47 pt above the name. Other
+# layouts (a list row, the Apps section) keep the tap on the name.
+ICON_ABOVE = 47.0
+ICON_ROOM = 80.0  # more than this between the title and the name: an icon fits
+TOP_HIT_DEPTH = 160.0  # farther below the title: not the top hit
 
 
-def big_change_since(t0, frac=0.2):
-    """Did the picture change over `frac` of its area since time t0 (frames service
-    history)? False when it can't tell."""
-    import json
-    try:
-        line, _ = screen.frames_request(f"history {t0}", timeout=2)
-        return any(f >= frac for _, f, _ in json.loads(line))
-    except (OSError, ValueError):
-        return False
+def _thumb():
+    """The picture, grey, 1/16 of the size (RuntimeError without one)."""
+    return screen.grab_rgb()[::16, ::16].mean(axis=2)
 
 
-def open_spotlight(h, tries=3):
-    """Cmd+Space until Spotlight is open: 1.6 s later the picture must differ from the
-    one before over most of its area (Spotlight blurs the screen behind its results).
-    Cmd+Space toggles Spotlight, so it is pressed again only when it isn't open."""
+def _differs(ref, frac=0.3):
+    """Does the picture differ from `ref` (a _thumb) over more than `frac` of it?
+    True when there is nothing to compare: the caller then goes on as if it did."""
     import numpy as np
+    if ref is None:
+        return True
+    try:
+        now = _thumb()
+    except RuntimeError:
+        return True
+    return now.shape == ref.shape and float((np.abs(now - ref) > 25).mean()) > frac
 
-    def small():
-        img = screen.grab_rgb()
-        return img[::16, ::16].mean(axis=2)
 
+def open_spotlight(h, at_home, tries=3):
+    """Cmd+Space until Spotlight is open: 1 s later the picture must differ from the
+    home screen's (`at_home`, a _thumb) over most of its area, as Spotlight blurs the
+    screen behind its results. Compared with the home screen, not with the picture
+    just before the key: Cmd+Space toggles Spotlight, and closing one that was still
+    open changed the picture as much as opening it, so that counted as open and the
+    name was typed into the home screen."""
     for _ in range(tries):
-        try:
-            before = small()
-        except RuntimeError:  # no picture: press and hope
-            h.cmd("key space gui")
-            time.sleep(1.2)
-            return True
         h.cmd("key space gui")
         time.sleep(1.0)  # it opens 0.2-0.5 s after the key, then animates
-        after = small()
-        if before.shape == after.shape and float((np.abs(after - before) > 25).mean()) > 0.3:
+        if _differs(at_home):
             try:  # let it finish opening; its field takes keys only a moment after
                 screen.frames_request("settle - 0.2 0", timeout=6)
             except OSError:
@@ -830,26 +857,50 @@ def _plain(text):
     return "".join(c for c in text.casefold() if c.isalnum())
 
 
+def _has_marks(lines):
+    marks = {_plain(m) for m in SPOTLIGHT_MARKS}
+    return any(_plain(t) in marks for _, _, t in lines)
+
+
 def spotlight_hit(name):
-    """Where Spotlight lists the app `name`, "missing" when it isn't among the results,
-    None when the screen can't be read (no models). The topmost line that is exactly
-    the name: the top hit's label, or the app in the Apps section when another app is
-    the top hit (typing "Gmail" puts Mail first). Never a near match (Gmail -> Mail).
-    A label cut short ("Google Ma…") counts when it starts the name."""
+    """Where to tap in Spotlight's results to open the app `name`; "missing" when it
+    isn't among them, "closed" when the screen isn't Spotlight's results, None when
+    the screen can't be read (no models)."""
     try:
         lines = screen_text()
     except SystemExit:
         return None
+    return spotlight_tap(lines, name, PT[1])
+
+
+def spotlight_tap(lines, name, screen_h_pt):
+    """spotlight_hit on lines read from the screen [(x, y, text)]. The topmost line
+    that is exactly the name: the top hit's, or the app in the Apps section when
+    another app is the top hit (typing "Gmail" puts Mail first). Never a near match
+    (Gmail -> Mail). A name cut short ("Google Ma…") counts when it starts the name.
+    Under an icon (ICON_ROOM), the icon is tapped instead of the name."""
+    if not _has_marks(lines):
+        return "closed"
     want = _plain(name)
     results = [(x, y, t) for x, y, t in lines if 0.06 < y < 0.88]  # not the search field at the bottom
-    for x, y, t in results:
-        if _plain(t) == want:
-            return x, y
-    for x, y, t in results:
-        cut = t.rstrip()
-        if (cut.endswith("…") or cut.endswith("...")) and len(_plain(cut)) >= 4 and want.startswith(_plain(cut)):
-            return x, y
-    return "missing"
+    found = next(((x, y) for x, y, t in results if _plain(t) == want), None)
+    if found is None:
+        for x, y, t in results:
+            cut = t.rstrip()
+            if (cut.endswith("…") or cut.endswith("...")) and len(_plain(cut)) >= 4 and want.startswith(_plain(cut)):
+                found = x, y
+                break
+    if found is None:
+        return "missing"
+    x, y = found
+    head = [ly for _, ly, t in lines if _plain(t) == "tophit" and ly < y]
+    if head and ICON_ROOM < (y - head[-1]) * screen_h_pt <= TOP_HIT_DEPTH:
+        # The top hit, with room for its icon above its name. Text between the title
+        # and the name may only be on the icon itself (Clock's "12", Calendar's date).
+        between = [(lx, ly) for lx, ly, _ in lines if head[-1] < ly < y - 0.005 and abs(lx - x) < 0.12]
+        if all(abs(lx - x) < 0.03 and (y - ly) * screen_h_pt < ICON_ABOVE + 40 for lx, ly in between):
+            return x, y - ICON_ABOVE / screen_h_pt
+    return x, y
 
 
 def type_text(h, text):

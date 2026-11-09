@@ -159,6 +159,32 @@ def test_screen_points_from_model():
         assert abs((w / h) / (pw / ph) - 1) < 0.0005
 
 
+def test_spotlight_tap():
+    from phoneuse import cli
+    H = 932  # iPhone 14 Pro Max, points
+    head = (0.116, 0.088, "Top Hit")
+    # Read from the phone (iOS 26.5): the top hit's icon above its name, sometimes with
+    # text on the icon itself; a tap on the name didn't open Weather, one on the icon did.
+    weather = [head, (0.173, 0.216, "Weather"), (0.391, 0.216, "Q weather"), (0.170, 0.279, "Suggestions")]
+    clock = [head, (0.172, 0.145, "12"), (0.172, 0.216, "Clock"), (0.391, 0.214, "Set Timer")]
+    calendar = [head, (0.171, 0.144, "Mon"), (0.170, 0.173, "9"), (0.172, 0.216, "Calendar")]
+    camera = [head, (0.391, 0.163, "日"), (0.172, 0.216, "Camera"), (0.391, 0.214, "Selfie")]
+    for lines, name in ((weather, "Weather"), (clock, "Clock"), (calendar, "Calendar"), (camera, "Camera")):
+        x, y = cli.spotlight_tap(lines, name, H)
+        assert abs(x - 0.172) < 0.002 and abs(y - (0.216 - 47 / H)) < 0.002, (name, x, y)
+    # A list row right under the title, and an app in the Apps section below another
+    # top hit: their names are tapped.
+    row = [head, (0.30, 0.13, "Weather"), (0.30, 0.19, "Weather Radar")]
+    assert cli.spotlight_tap(row, "Weather", H) == (0.30, 0.13)
+    apps = [head, (0.172, 0.216, "Mail"), (0.08, 0.30, "Apps"), (0.172, 0.40, "Gmail")]
+    assert cli.spotlight_tap(apps, "Gmail", H) == (0.172, 0.40)
+    # Exact names only; no Spotlight titles on the screen: not Spotlight (the home
+    # screen's own icon labels matched once).
+    assert cli.spotlight_tap(weather, "Weath", H) == "missing"
+    assert cli.spotlight_tap([(0.27, 0.75, "Weather"), (0.5, 0.9, "Search")], "Weather", H) == "closed"
+    assert cli.spotlight_tap([head, (0.172, 0.216, "Google Ma…")], "Google Maps", H)[0] == 0.172
+
+
 def test_drag_table_round_trip():
     for units in (1, 3, 7.5, 16, 28):
         assert abs(touch.units_for(touch.points_for(units)) - units) < 1e-6

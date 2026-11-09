@@ -92,10 +92,17 @@ points, which is plenty for scrolling and edge gestures.
 - Scroll drags over LE use small steps (at most 6 pt a report) and a steady end, and
   go 8 pt further than asked: a scroll view starts following the finger only after a
   few points, and those never come back (scroll-by fell 7.5-10 pt short).
-- `open` checks each step on the screen: the first Spotlight opened right after an
-  app closes ignores typed keys, Spotlight keeps its last search, and Enter once left
-  the home screen; so it opens Spotlight again when needed, selects the old search,
-  and taps the app it finds instead of pressing Enter.
+- `open` checks each step on the screen (iPhone 14 Pro Max, iOS 26.5):
+  - An app opened from Spotlight goes back to Spotlight on Home, so Home is pressed
+    twice.
+  - Cmd+Space toggles Spotlight, so it counts as open only when the picture differs
+    from the home screen's, and matches count only under Spotlight's section titles.
+  - Right after an app closes, Spotlight sometimes takes no keys for a moment, so the
+    name is typed again.
+  - Spotlight keeps its last search, so that is selected first.
+  - The top hit's icon is tapped, not its name: a tap on Weather's name did nothing.
+  - The app must come up. Enter is never pressed after a miss: it opened the last
+    search's app.
 - In the mirror window Ctrl is Cmd: the Windows key belongs to the Start menu.
 
 ## iPhone settings this relies on
